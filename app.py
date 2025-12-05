@@ -33,6 +33,7 @@ MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "50"))
 MAX_PARALLEL_PAGES = int(os.getenv("MAX_PARALLEL_PAGES", "8"))
 MAX_PREVIEW_PAGES = int(os.getenv("MAX_PREVIEW_PAGES", "10"))  # Limit preview rendering
+PAGES_PER_CHUNK = int(os.getenv("PAGES_PER_CHUNK", "8"))  # Pages per API request for GPU batching
 
 # PaddleOCR-VL API Configuration
 PADDLEOCR_VL_API_URL = os.getenv(
@@ -175,8 +176,51 @@ def get_pdf_page_count(file_content: bytes) -> int:
         return 0
 
 
+def split_pdf_into_chunks(
+    file_content: bytes, pages_per_chunk: int = None
+) -> list[tuple[int, int, bytes]]:
+    """
+    Split a PDF into chunks of multiple pages for efficient batch processing.
+
+    This enables better GPU utilization by sending multiple pages to vLLM at once,
+    allowing it to batch-process them together.
+
+    Args:
+        file_content: Raw PDF bytes
+        pages_per_chunk: Number of pages per chunk (default: PAGES_PER_CHUNK)
+
+    Returns:
+        List of tuples: (start_page, end_page, chunk_pdf_bytes)
+        Page numbers are 0-indexed.
+    """
+    if pages_per_chunk is None:
+        pages_per_chunk = PAGES_PER_CHUNK
+
+    chunks = []
+    try:
+        doc = fitz.open(stream=file_content, filetype="pdf")
+        total_pages = len(doc)
+
+        for start_page in range(0, total_pages, pages_per_chunk):
+            end_page = min(start_page + pages_per_chunk - 1, total_pages - 1)
+
+            # Create a new PDF with this chunk of pages
+            chunk_doc = fitz.open()
+            chunk_doc.insert_pdf(doc, from_page=start_page, to_page=end_page)
+            chunk_bytes = chunk_doc.tobytes()
+            chunk_doc.close()
+
+            chunks.append((start_page, end_page, chunk_bytes))
+
+        doc.close()
+    except Exception as e:
+        raise RuntimeError(f"Failed to split PDF into chunks: {e}")
+
+    return chunks
+
+
 def split_pdf_into_pages(file_content: bytes) -> list[bytes]:
-    """Split a PDF into individual single-page PDFs."""
+    """Split a PDF into individual single-page PDFs (legacy, for small PDFs)."""
     pages = []
     try:
         doc = fitz.open(stream=file_content, filetype="pdf")
@@ -272,33 +316,40 @@ def process_document(
     return response.json()
 
 
-def process_single_page(args: tuple) -> tuple[int, dict | None, str | None]:
+def process_chunk(args: tuple) -> tuple[int, int, list | None, str | None]:
     """
-    Process a single PDF page. Helper function for parallel processing.
+    Process a chunk of PDF pages. Helper function for parallel chunk processing.
+
+    Each chunk contains multiple pages, which allows vLLM to batch-process them
+    together for better GPU utilization.
 
     Args:
-        args: Tuple of (page_num, page_content, filename, options, cancel_event)
+        args: Tuple of (chunk_index, start_page, end_page, chunk_content, filename, options, cancel_event)
 
     Returns:
-        Tuple of (page_num, result_dict, error_message)
+        Tuple of (chunk_index, start_page, parsing_results_list, error_message)
     """
-    page_num, page_content, filename, options, cancel_event = args
+    chunk_index, start_page, end_page, chunk_content, filename, options, cancel_event = args
+    num_pages_in_chunk = end_page - start_page + 1
 
     # Check for cancellation before starting
     if cancel_event and cancel_event.is_set():
-        return (page_num, None, "Cancelled")
+        return (chunk_index, start_page, None, "Cancelled")
 
     try:
-        page_response = process_document(
-            file_content=page_content,
+        # Send multi-page chunk to API - vLLM will batch-process all pages together
+        chunk_response = process_document(
+            file_content=chunk_content,
             filename=filename,
             **options,
         )
-        result = page_response.get("result", {})
+        result = chunk_response.get("result", {})
         parsing_results = result.get("layoutParsingResults", [])
-        return (page_num, parsing_results, None)
+
+        # Each parsing result corresponds to a page in the chunk
+        return (chunk_index, start_page, parsing_results, None)
     except Exception as e:
-        return (page_num, None, str(e))
+        return (chunk_index, start_page, None, str(e))
 
 
 def process_pdf_in_batches(
@@ -307,17 +358,24 @@ def process_pdf_in_batches(
     progress_callback=None,
     cancel_event: threading.Event = None,
     max_workers: int = None,
+    pages_per_chunk: int = None,
     **options,
 ) -> dict:
     """
-    Process a PDF document with parallel page processing for better performance.
+    Process a PDF document with chunked parallel processing for optimal GPU utilization.
+
+    Instead of processing single pages, this splits the PDF into multi-page chunks
+    (e.g., 8 pages each). Each chunk is sent to the API as a multi-page PDF, allowing
+    vLLM to batch-process all pages in the chunk together. This dramatically improves
+    GPU utilization compared to single-page processing.
 
     Args:
         file_content: Raw bytes of the PDF file
         filename: Original filename
         progress_callback: Optional callback function(completed_pages, total_pages)
         cancel_event: Optional threading.Event to signal cancellation
-        max_workers: Maximum parallel workers (default: MAX_PARALLEL_PAGES)
+        max_workers: Maximum parallel chunk workers (default: MAX_PARALLEL_PAGES)
+        pages_per_chunk: Pages per chunk for GPU batching (default: PAGES_PER_CHUNK)
         **options: Processing options passed to process_document
 
     Returns:
@@ -326,77 +384,93 @@ def process_pdf_in_batches(
     Raises:
         CancellationError: If processing was cancelled by user
     """
-    # Split PDF into individual pages
-    page_contents = split_pdf_into_pages(file_content)
-    total_pages = len(page_contents)
+    # Use defaults if not specified
+    if max_workers is None:
+        max_workers = MAX_PARALLEL_PAGES
+    if pages_per_chunk is None:
+        pages_per_chunk = PAGES_PER_CHUNK
 
+    # Get total page count first
+    total_pages = get_pdf_page_count(file_content)
     if total_pages == 0:
         raise RuntimeError("PDF has no pages or could not be read")
 
-    # Use configured max workers or default
-    if max_workers is None:
-        max_workers = MAX_PARALLEL_PAGES
+    # For small PDFs, adjust chunk size to avoid overhead
+    # e.g., 12 pages with chunk=8 → better to do 6+6 than 8+4
+    num_chunks = (total_pages + pages_per_chunk - 1) // pages_per_chunk
+    if num_chunks > 1:
+        # Distribute pages more evenly across chunks
+        adjusted_chunk_size = (total_pages + num_chunks - 1) // num_chunks
+        pages_per_chunk = max(1, adjusted_chunk_size)
 
-    # Prepare arguments for parallel processing (include cancel_event)
+    # Split PDF into multi-page chunks
+    chunks = split_pdf_into_chunks(file_content, pages_per_chunk)
+    num_chunks = len(chunks)
+
+    # Prepare arguments for parallel chunk processing
     process_args = [
-        (page_num, page_content, filename, options, cancel_event)
-        for page_num, page_content in enumerate(page_contents)
+        (chunk_idx, start_page, end_page, chunk_bytes, filename, options, cancel_event)
+        for chunk_idx, (start_page, end_page, chunk_bytes) in enumerate(chunks)
     ]
 
-    # Process pages in parallel
-    results_dict = {}
+    # Process chunks in parallel (each chunk is batch-processed by vLLM)
+    results_dict = {}  # page_num -> parsing_result
     errors = []
-    completed = 0
+    completed_pages = 0
     cancelled = False
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
-        future_to_page = {
-            executor.submit(process_single_page, args): args[0] for args in process_args
+        # Submit all chunk tasks
+        future_to_chunk = {
+            executor.submit(process_chunk, args): (args[0], args[1], args[2])  # chunk_idx, start, end
+            for args in process_args
         }
 
-        # Collect results as they complete
-        for future in as_completed(future_to_page):
+        # Collect results as chunks complete
+        for future in as_completed(future_to_chunk):
             # Check for cancellation
             if cancel_event and cancel_event.is_set():
                 cancelled = True
-                # Cancel remaining futures
-                for f in future_to_page:
+                for f in future_to_chunk:
                     f.cancel()
                 break
 
-            page_num, parsing_results, error = future.result()
-            completed += 1
+            chunk_idx, start_page, parsing_results, error = future.result()
+            _, chunk_start, chunk_end = future_to_chunk[future]
+            pages_in_chunk = chunk_end - chunk_start + 1
+            completed_pages += pages_in_chunk
 
             if progress_callback:
-                progress_callback(completed, total_pages)
+                progress_callback(completed_pages, total_pages)
 
             if error:
                 if error == "Cancelled":
                     cancelled = True
                 else:
-                    errors.append(f"Page {page_num + 1}: {error}")
+                    errors.append(f"Chunk {chunk_idx + 1} (pages {chunk_start + 1}-{chunk_end + 1}): {error}")
             elif parsing_results:
-                results_dict[page_num] = parsing_results
+                # Map each parsing result to its actual page number
+                for i, pr in enumerate(parsing_results):
+                    actual_page_num = start_page + i
+                    results_dict[actual_page_num] = pr
 
     # Handle cancellation
     if cancelled:
         raise CancellationError(
-            f"Processing cancelled after {completed} of {total_pages} pages"
+            f"Processing cancelled after {completed_pages} of {total_pages} pages"
         )
 
     # Report any errors
     if errors:
-        error_summary = "; ".join(errors[:5])  # Show first 5 errors
+        error_summary = "; ".join(errors[:5])
         if len(errors) > 5:
             error_summary += f" ... and {len(errors) - 5} more errors"
-        raise RuntimeError(f"Some pages failed to process: {error_summary}")
+        raise RuntimeError(f"Some chunks failed to process: {error_summary}")
 
     # Combine results in page order
     all_parsing_results = []
     for page_num in sorted(results_dict.keys()):
-        for pr in results_dict[page_num]:
-            all_parsing_results.append(pr)
+        all_parsing_results.append(results_dict[page_num])
 
     # Combine all results into a single response structure
     combined_response = {
