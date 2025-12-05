@@ -10,6 +10,7 @@ import io
 import os
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import fitz  # PyMuPDF for PDF preview
@@ -27,6 +28,7 @@ APP_DESCRIPTION = os.getenv(
 )
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "50"))
+MAX_PARALLEL_PAGES = int(os.getenv("MAX_PARALLEL_PAGES", "4"))
 
 # PaddleOCR-VL API Configuration
 PADDLEOCR_VL_API_URL = os.getenv(
@@ -126,6 +128,24 @@ def get_pdf_page_count(file_content: bytes) -> int:
         return 0
 
 
+def split_pdf_into_pages(file_content: bytes) -> list[bytes]:
+    """Split a PDF into individual single-page PDFs."""
+    pages = []
+    try:
+        doc = fitz.open(stream=file_content, filetype="pdf")
+        for page_num in range(len(doc)):
+            # Create a new PDF with just this page
+            single_page_doc = fitz.open()
+            single_page_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
+            page_bytes = single_page_doc.tobytes()
+            pages.append(page_bytes)
+            single_page_doc.close()
+        doc.close()
+    except Exception as e:
+        raise RuntimeError(f"Failed to split PDF: {e}")
+    return pages
+
+
 def display_file_preview(uploaded_file, file_content: bytes):
     """Display a preview of the uploaded file."""
     filename = uploaded_file.name.lower()
@@ -202,6 +222,117 @@ def process_document(
         raise RuntimeError(f"API request failed: {error_msg}")
 
     return response.json()
+
+
+def process_single_page(args: tuple) -> tuple[int, dict | None, str | None]:
+    """
+    Process a single PDF page. Helper function for parallel processing.
+
+    Args:
+        args: Tuple of (page_num, page_content, filename, options)
+
+    Returns:
+        Tuple of (page_num, result_dict, error_message)
+    """
+    page_num, page_content, filename, options = args
+    try:
+        page_response = process_document(
+            file_content=page_content,
+            filename=filename,
+            **options,
+        )
+        result = page_response.get("result", {})
+        parsing_results = result.get("layoutParsingResults", [])
+        return (page_num, parsing_results, None)
+    except Exception as e:
+        return (page_num, None, str(e))
+
+
+def process_pdf_in_batches(
+    file_content: bytes,
+    filename: str,
+    progress_callback=None,
+    max_workers: int = None,
+    **options,
+) -> dict:
+    """
+    Process a PDF document with parallel page processing for better performance.
+
+    Args:
+        file_content: Raw bytes of the PDF file
+        filename: Original filename
+        progress_callback: Optional callback function(completed_pages, total_pages)
+        max_workers: Maximum parallel workers (default: MAX_PARALLEL_PAGES)
+        **options: Processing options passed to process_document
+
+    Returns:
+        Combined API response dictionary with all pages
+    """
+    # Split PDF into individual pages
+    page_contents = split_pdf_into_pages(file_content)
+    total_pages = len(page_contents)
+
+    if total_pages == 0:
+        raise RuntimeError("PDF has no pages or could not be read")
+
+    # Use configured max workers or default
+    if max_workers is None:
+        max_workers = MAX_PARALLEL_PAGES
+
+    # Prepare arguments for parallel processing
+    process_args = [
+        (page_num, page_content, filename, options)
+        for page_num, page_content in enumerate(page_contents)
+    ]
+
+    # Process pages in parallel
+    results_dict = {}
+    errors = []
+    completed = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_page = {
+            executor.submit(process_single_page, args): args[0]
+            for args in process_args
+        }
+
+        # Collect results as they complete
+        for future in as_completed(future_to_page):
+            page_num, parsing_results, error = future.result()
+            completed += 1
+
+            if progress_callback:
+                progress_callback(completed, total_pages)
+
+            if error:
+                errors.append(f"Page {page_num + 1}: {error}")
+            elif parsing_results:
+                results_dict[page_num] = parsing_results
+
+    # Report any errors
+    if errors:
+        error_summary = "; ".join(errors[:5])  # Show first 5 errors
+        if len(errors) > 5:
+            error_summary += f" ... and {len(errors) - 5} more errors"
+        raise RuntimeError(f"Some pages failed to process: {error_summary}")
+
+    # Combine results in page order
+    all_parsing_results = []
+    for page_num in sorted(results_dict.keys()):
+        for pr in results_dict[page_num]:
+            all_parsing_results.append(pr)
+
+    # Combine all results into a single response structure
+    combined_response = {
+        "errorCode": 0,
+        "errorMsg": "Success",
+        "result": {
+            "layoutParsingResults": all_parsing_results,
+        },
+    }
+
+    return combined_response
 
 
 def extract_markdown_from_response(api_response: dict) -> tuple[str, dict]:
@@ -409,6 +540,7 @@ def main():
 
     for uploaded_file, file_content in valid_files:
         file_key = f"{uploaded_file.name}_{uploaded_file.size}"
+        is_pdf = uploaded_file.name.lower().endswith(".pdf")
 
         with st.expander(f"📄 {uploaded_file.name}", expanded=True):
             # Check if already processed
@@ -419,28 +551,47 @@ def main():
                 images = cached["images"]
             else:
                 try:
-                    # Process file
-                    with st.spinner(f"Processing {uploaded_file.name}..."):
-                        start_time = time.time()
+                    start_time = time.time()
 
-                        api_response = process_document(
+                    if is_pdf:
+                        # Use batch processing for PDFs to handle all pages
+                        page_count = get_pdf_page_count(file_content)
+                        progress_bar = st.progress(0, text=f"Processing page 1/{page_count}...")
+
+                        def update_progress(current, total):
+                            progress_bar.progress(
+                                current / total,
+                                text=f"Processing page {current}/{total}..."
+                            )
+
+                        api_response = process_pdf_in_batches(
                             file_content=file_content,
                             filename=uploaded_file.name,
+                            progress_callback=update_progress,
                             **options,
                         )
+                        progress_bar.empty()
+                    else:
+                        # Process single image directly
+                        with st.spinner(f"Processing {uploaded_file.name}..."):
+                            api_response = process_document(
+                                file_content=file_content,
+                                filename=uploaded_file.name,
+                                **options,
+                            )
 
-                        markdown_text, images = extract_markdown_from_response(
-                            api_response
-                        )
+                    markdown_text, images = extract_markdown_from_response(
+                        api_response
+                    )
 
-                        processing_time = time.time() - start_time
-                        st.success(f"✅ Processed in {processing_time:.1f} seconds")
+                    processing_time = time.time() - start_time
+                    st.success(f"✅ Processed in {processing_time:.1f} seconds")
 
-                        # Cache results
-                        st.session_state.processing_results[file_key] = {
-                            "markdown": markdown_text,
-                            "images": images,
-                            "response": api_response,
+                    # Cache results
+                    st.session_state.processing_results[file_key] = {
+                        "markdown": markdown_text,
+                        "images": images,
+                        "response": api_response,
                         }
 
                 except requests.Timeout:
