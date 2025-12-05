@@ -1,5 +1,5 @@
 # vLLM Configuration for PaddleOCR-VL
-# Adjust these settings if you encounter memory errors
+# Optimized for high-throughput PDF processing
 #
 # Common fixes for "No available memory for cache blocks":
 # 1. Increase gpu_memory_utilization (up to 0.98)
@@ -10,22 +10,31 @@
 # NOTE: vLLM uses underscores in YAML config keys, not hyphens!
 
 # GPU memory fraction to use (0.0-1.0)
-# Higher = more memory for model, less for KV cache
-# Try 0.98 if you still get memory errors
-gpu_memory_utilization: 0.50
+# Higher = more memory for model and KV cache = better batching
+# 0.90 is aggressive but safe for dedicated GPU
+gpu_memory_utilization: 0.90
 
-# Maximum concurrent sequences
-# Reduce if OOM during inference (try 16 or 8 for low VRAM GPUs)
-max_num_seqs: 32
+# Maximum concurrent sequences - KEY for parallel page processing!
+# Higher = more pages processed simultaneously
+# Match or exceed MAX_PARALLEL_PAGES for best throughput
+max_num_seqs: 64
 
 # Maximum context length
-# Increase for longer documents, decrease if OOM
 # PaddleOCR-VL supports up to 32768 tokens
+# 8192 is good for most documents
 max_model_len: 8192
 
 # Disable CUDA graphs (uses less memory but slower)
-# Set to true for GPUs with limited VRAM
+# Keep false for best performance if you have enough VRAM
 enforce_eager: false
 
-# Reduce batched tokens for memory savings
-max_num_batched_tokens: 8192
+# Maximum batched tokens - controls throughput
+# Higher = more efficient GPU utilization
+# Should be >= max_model_len for optimal batching
+max_num_batched_tokens: 16384
+
+# Enable chunked prefill for better memory efficiency with long contexts
+enable_chunked_prefill: true
+
+# Speculative decoding disabled (not needed for OCR)
+# num_speculative_tokens: 0

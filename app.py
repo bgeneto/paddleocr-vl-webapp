@@ -17,6 +17,8 @@ import fitz  # PyMuPDF for PDF preview
 import requests
 import streamlit as st
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 load_dotenv()
 
@@ -28,7 +30,7 @@ APP_DESCRIPTION = os.getenv(
 )
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "50"))
-MAX_PARALLEL_PAGES = int(os.getenv("MAX_PARALLEL_PAGES", "4"))
+MAX_PARALLEL_PAGES = int(os.getenv("MAX_PARALLEL_PAGES", "8"))
 
 # PaddleOCR-VL API Configuration
 PADDLEOCR_VL_API_URL = os.getenv(
@@ -48,6 +50,43 @@ VISUALIZE_RESULTS = os.getenv("VISUALIZE_RESULTS", "false").lower() == "true"
 
 # Supported file types
 SUPPORTED_EXTENSIONS = [".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp"]
+
+
+# HTTP Session with connection pooling for better performance
+def create_http_session() -> requests.Session:
+    """Create an HTTP session with connection pooling and retry logic."""
+    session = requests.Session()
+
+    # Configure retry strategy
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[500, 502, 503, 504],
+    )
+
+    # Configure connection pooling - increase pool size for parallel requests
+    adapter = HTTPAdapter(
+        pool_connections=MAX_PARALLEL_PAGES + 2,
+        pool_maxsize=MAX_PARALLEL_PAGES + 2,
+        max_retries=retry_strategy,
+    )
+
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
+    return session
+
+
+# Global session for connection reuse
+_http_session: requests.Session | None = None
+
+
+def get_http_session() -> requests.Session:
+    """Get or create the global HTTP session."""
+    global _http_session
+    if _http_session is None:
+        _http_session = create_http_session()
+    return _http_session
 
 
 def check_api_health() -> bool:
@@ -209,8 +248,9 @@ def process_document(
         "visualize": visualize,
     }
 
-    # Make API request
-    response = requests.post(
+    # Make API request using pooled session
+    session = get_http_session()
+    response = session.post(
         PADDLEOCR_VL_API_URL,
         json=payload,
         timeout=API_TIMEOUT,

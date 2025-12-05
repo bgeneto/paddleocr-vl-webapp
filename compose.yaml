@@ -38,7 +38,7 @@ services:
       - APP_DESCRIPTION=${APP_DESCRIPTION:-Upload PDF or image files to convert them to Markdown using PaddleOCR-VL with vLLM backend}
       - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-50}
       - MAX_PDF_PAGES=${MAX_PDF_PAGES:-50}
-      - MAX_PARALLEL_PAGES=${MAX_PARALLEL_PAGES:-4}
+      - MAX_PARALLEL_PAGES=${MAX_PARALLEL_PAGES:-8}
       # Processing Options
       - USE_DOC_ORIENTATION_CLASSIFY=${USE_DOC_ORIENTATION_CLASSIFY:-false}
       - USE_DOC_UNWARPING=${USE_DOC_UNWARPING:-false}
