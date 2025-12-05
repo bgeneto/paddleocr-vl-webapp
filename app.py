@@ -90,7 +90,10 @@ def validate_file(uploaded_file) -> tuple[bool, str]:
     # Check file size
     file_size_mb = uploaded_file.size / (1024 * 1024)
     if file_size_mb > MAX_FILE_SIZE_MB:
-        return False, f"File size ({file_size_mb:.1f}MB) exceeds maximum ({MAX_FILE_SIZE_MB}MB)"
+        return (
+            False,
+            f"File size ({file_size_mb:.1f}MB) exceeds maximum ({MAX_FILE_SIZE_MB}MB)",
+        )
 
     return True, "Valid"
 
@@ -104,7 +107,7 @@ def get_pdf_preview(file_content: bytes, max_pages: int = 5) -> list[bytes]:
         for page_num in range(num_pages):
             page = doc.load_page(page_num)
             # Render at 150 DPI for preview (good balance of quality and size)
-            pix = page.get_pixmap(matrix=fitz.Matrix(150/72, 150/72))
+            pix = page.get_pixmap(matrix=fitz.Matrix(150 / 72, 150 / 72))
             previews.append(pix.tobytes("png"))
         doc.close()
     except Exception as e:
@@ -136,13 +139,13 @@ def display_file_preview(uploaded_file, file_content: bytes):
             cols = st.columns(min(len(previews), 3))
             for idx, preview in enumerate(previews):
                 with cols[idx]:
-                    st.image(preview, caption=f"Page {idx + 1}", use_container_width=True)
+                    st.image(preview, caption=f"Page {idx + 1}", width="stretch")
             if page_count > 3:
                 st.caption(f"... and {page_count - 3} more page(s)")
     else:
         # Image preview
         st.caption(f"🖼️ Image - {uploaded_file.size / 1024:.1f} KB")
-        st.image(file_content, caption=uploaded_file.name, use_container_width=True)
+        st.image(file_content, caption=uploaded_file.name, width="stretch")
 
 
 def process_document(
@@ -391,7 +394,7 @@ def main():
         start_button = st.button(
             "🔍 Start OCR",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             help="Process all uploaded documents with OCR",
         )
     with col2:
@@ -426,7 +429,9 @@ def main():
                             **options,
                         )
 
-                        markdown_text, images = extract_markdown_from_response(api_response)
+                        markdown_text, images = extract_markdown_from_response(
+                            api_response
+                        )
 
                         processing_time = time.time() - start_time
                         st.success(f"✅ Processed in {processing_time:.1f} seconds")
@@ -469,7 +474,7 @@ def main():
                     for idx, (img_path, img_data) in enumerate(images.items()):
                         with cols[idx % 3]:
                             img_bytes = decode_base64_image(img_data)
-                            st.image(img_bytes, caption=img_path, use_container_width=True)
+                            st.image(img_bytes, caption=img_path, width="stretch")
 
             with tab_raw:
                 st.code(markdown_text, language="markdown")
@@ -491,7 +496,9 @@ def main():
                 with col2:
                     # Download as ZIP with images
                     if images:
-                        zip_data = create_download_zip(markdown_text, images, base_filename)
+                        zip_data = create_download_zip(
+                            markdown_text, images, base_filename
+                        )
                         st.download_button(
                             label="📦 Download ZIP (with images)",
                             data=zip_data,
@@ -513,14 +520,16 @@ def main():
                     if output_images:
                         st.subheader("🔍 Processing Visualization")
                         vis_cols = st.columns(min(len(output_images), 2))
-                        for idx, (img_name, img_data) in enumerate(output_images.items()):
+                        for idx, (img_name, img_data) in enumerate(
+                            output_images.items()
+                        ):
                             if img_data:
                                 with vis_cols[idx % 2]:
                                     img_bytes = decode_base64_image(img_data)
                                     st.image(
                                         img_bytes,
                                         caption=img_name.replace("_", " ").title(),
-                                        use_container_width=True,
+                                        width="stretch",
                                     )
 
     # Batch download section
@@ -528,11 +537,15 @@ def main():
         st.header("📦 Batch Download")
         if st.button("Download All Results as ZIP"):
             batch_zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(batch_zip_buffer, "w", zipfile.ZIP_DEFLATED) as batch_zip:
+            with zipfile.ZipFile(
+                batch_zip_buffer, "w", zipfile.ZIP_DEFLATED
+            ) as batch_zip:
                 for file_key, data in st.session_state.processing_results.items():
                     base_name = file_key.rsplit("_", 1)[0]  # Remove size suffix
                     base_name = Path(base_name).stem
-                    batch_zip.writestr(f"{base_name}/{base_name}.md", data["markdown"].encode("utf-8"))
+                    batch_zip.writestr(
+                        f"{base_name}/{base_name}.md", data["markdown"].encode("utf-8")
+                    )
                     for img_path, img_data in data["images"].items():
                         img_bytes = decode_base64_image(img_data)
                         batch_zip.writestr(f"{base_name}/images/{img_path}", img_bytes)
