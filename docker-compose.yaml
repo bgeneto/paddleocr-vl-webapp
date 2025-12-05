@@ -1,0 +1,129 @@
+
+# PaddleOCR-VL Document Parser with vLLM Backend
+#
+# This docker-compose file sets up a production-ready document OCR service using:
+# - PaddleOCR-VL API service with layout detection
+# - vLLM backend for accelerated VLM inference
+# - Streamlit web interface for user interaction
+#
+# Requirements:
+# - Docker >= 19.03
+# - NVIDIA GPU with CUDA 12.6+ support
+# - Compute Capability >= 8.0 for vLLM (RTX 30/40/50 series, A10, A100, etc.)
+#
+# Usage:
+#   docker compose up -d
+#   # Access the app at http://localhost:8501
+
+services:
+  # Streamlit Web Application
+  streamlit-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paddleocr-vl-streamlit
+    ports:
+      - "${STREAMLIT_HOST_PORT:-8501}:8501"
+    environment:
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+      - STREAMLIT_THEME_BASE=light
+      # API Configuration
+      - PADDLEOCR_VL_API_URL=http://paddleocr-vl-api:8080/layout-parsing
+      - API_TIMEOUT=${API_TIMEOUT:-300}
+      # App Configuration
+      - APP_TITLE=${APP_TITLE:-PaddleOCR-VL Document Parser}
+      - APP_DESCRIPTION=${APP_DESCRIPTION:-Upload PDF or image files to convert them to Markdown using PaddleOCR-VL with vLLM backend}
+      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-50}
+      - MAX_PDF_PAGES=${MAX_PDF_PAGES:-50}
+      # Processing Options
+      - USE_DOC_ORIENTATION_CLASSIFY=${USE_DOC_ORIENTATION_CLASSIFY:-false}
+      - USE_DOC_UNWARPING=${USE_DOC_UNWARPING:-false}
+      - USE_LAYOUT_DETECTION=${USE_LAYOUT_DETECTION:-true}
+      - USE_CHART_RECOGNITION=${USE_CHART_RECOGNITION:-false}
+      - PRETTIFY_MARKDOWN=${PRETTIFY_MARKDOWN:-true}
+      - VISUALIZE_RESULTS=${VISUALIZE_RESULTS:-false}
+    volumes:
+      - ./app.py:/app/app.py:ro
+      - ./logs:/app/logs
+    depends_on:
+      paddleocr-vl-api:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8501/_stcore/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - ocr-network
+
+  # PaddleOCR-VL API Service (Pipeline)
+  paddleocr-vl-api:
+    image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl:${API_IMAGE_TAG_SUFFIX:-latest-offline}
+    container_name: paddleocr-vl-api
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_DEVICE_ID:-0}"]
+              capabilities: [gpu]
+    user: root
+    restart: unless-stopped
+    environment:
+      - VLM_BACKEND=${VLM_BACKEND:-vllm}
+    command: /bin/bash -c "paddlex --serve --pipeline /home/paddleocr/pipeline_config_${VLM_BACKEND:-vllm}.yaml"
+    depends_on:
+      paddleocr-vlm-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - ocr-network
+
+  # VLM Inference Service (vLLM or FastDeploy)
+  paddleocr-vlm-server:
+    image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-${VLM_BACKEND:-vllm}-server:${VLM_IMAGE_TAG_SUFFIX:-latest-offline}
+    container_name: paddleocr-vlm-server
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_DEVICE_ID:-0}"]
+              capabilities: [gpu]
+    user: root
+    restart: unless-stopped
+    volumes:
+      - ./vllm_config.yaml:/tmp/vllm_config.yaml:ro
+    command: >
+      paddleocr genai_server
+      --model_name PaddleOCR-VL-0.9B
+      --host 0.0.0.0
+      --port 8080
+      --backend ${VLM_BACKEND:-vllm}
+      --backend_config /tmp/vllm_config.yaml
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 300s
+    networks:
+      - ocr-network
+
+volumes:
+  uploads:
+    driver: local
+
+networks:
+  ocr-network:
+    driver: bridge
