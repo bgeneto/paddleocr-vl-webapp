@@ -1,0 +1,67 @@
+# Git
+.git/
+.gitignore
+
+# Environment files (use docker-compose env_file or build args)
+.env
+.env.example
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Archives
+*.zip
+*.tar.gz
+*.rar
+
+# Documentation
+README.md
+*.md
+
+# Docker files (not needed inside container)
+docker-compose*.yaml
+docker-compose*.yml
+Dockerfile*
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Model files
+*.onnx
+*.pdmodel
+*.pdiparams
+*.pt
+*.pth
+
+# Test files
+tests/
+test_*.py
+
+# Uploaded files
+uploads/
