@@ -22,7 +22,7 @@ max_num_seqs: 64
 # Maximum context length
 # PaddleOCR-VL supports up to 32768 tokens
 # 8192 is good for most documents
-max_model_len: 8192
+max_model_len: 16384
 
 # Disable CUDA graphs (uses less memory but slower)
 # Keep false for best performance if you have enough VRAM
@@ -31,10 +31,9 @@ enforce_eager: false
 # Maximum batched tokens - controls throughput
 # Higher = more efficient GPU utilization
 # Should be >= max_model_len for optimal batching
-max_num_batched_tokens: 16384
+max_num_batched_tokens: 65536
 
 # Enable chunked prefill for better memory efficiency with long contexts
 enable_chunked_prefill: true
-
 # Speculative decoding disabled (not needed for OCR)
 # num_speculative_tokens: 0
