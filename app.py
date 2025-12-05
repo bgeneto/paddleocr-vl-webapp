@@ -487,9 +487,18 @@ def process_pdf_in_batches(
     return combined_response
 
 
-def extract_markdown_from_response(api_response: dict) -> tuple[str, dict]:
+def extract_markdown_from_response(api_response: dict, base_filename: str = "document") -> tuple[str, dict]:
     """
     Extract markdown text and images from API response.
+
+    Rewrites image paths in the markdown to match the ZIP archive structure:
+    - Original: imgs/img_xxx.jpg
+    - Rewritten: {base_filename}_images/page_{n}/img_xxx.jpg (multi-page)
+    - Rewritten: {base_filename}_images/img_xxx.jpg (single-page)
+
+    Args:
+        api_response: The API response dictionary
+        base_filename: Base filename for constructing image paths (without extension)
 
     Returns:
         Tuple of (markdown_text, images_dict)
@@ -502,23 +511,34 @@ def extract_markdown_from_response(api_response: dict) -> tuple[str, dict]:
 
     markdown_parts = []
     all_images = {}
+    images_dir = f"{base_filename}_images"
 
     for i, page_result in enumerate(parsing_results):
         markdown_info = page_result.get("markdown", {})
         markdown_text = markdown_info.get("text", "")
         images = markdown_info.get("images", {})
 
+        # Rewrite image paths in markdown to match ZIP structure
+        for original_path, img_data in images.items():
+            # Extract just the filename from the original path (e.g., "imgs/img_xxx.jpg" -> "img_xxx.jpg")
+            img_filename = Path(original_path).name
+
+            if len(parsing_results) > 1:
+                # Multi-page: store under page subdirectory
+                new_path = f"{images_dir}/page_{i + 1}/{img_filename}"
+                all_images[f"page_{i + 1}/{img_filename}"] = img_data
+            else:
+                # Single-page: store directly in images directory
+                new_path = f"{images_dir}/{img_filename}"
+                all_images[img_filename] = img_data
+
+            # Replace original path with new path in markdown
+            markdown_text = markdown_text.replace(original_path, new_path)
+
         if len(parsing_results) > 1:
             markdown_parts.append(f"<!-- Page {i + 1} -->\n\n{markdown_text}")
         else:
             markdown_parts.append(markdown_text)
-
-        # Prefix image paths with page number for multi-page documents
-        for img_path, img_data in images.items():
-            if len(parsing_results) > 1:
-                all_images[f"page_{i + 1}/{img_path}"] = img_data
-            else:
-                all_images[img_path] = img_data
 
     full_markdown = "\n\n---\n\n".join(markdown_parts)
     return full_markdown, all_images
@@ -527,6 +547,10 @@ def extract_markdown_from_response(api_response: dict) -> tuple[str, dict]:
 def create_download_zip(markdown_text: str, images: dict, base_filename: str) -> bytes:
     """
     Create a ZIP file containing the markdown and associated images.
+
+    The images dict keys should already contain the relative paths that match
+    the image references in the markdown (e.g., "page_1/img_xxx.jpg").
+    Images will be stored under {base_filename}_images/ directory.
 
     Returns:
         Bytes of the ZIP file
@@ -537,10 +561,12 @@ def create_download_zip(markdown_text: str, images: dict, base_filename: str) ->
         # Add markdown file
         zip_file.writestr(f"{base_filename}.md", markdown_text.encode("utf-8"))
 
-        # Add images
+        # Add images - paths in images dict are relative (e.g., "page_1/img.jpg")
+        # Store them under {base_filename}_images/ to match markdown references
+        images_dir = f"{base_filename}_images"
         for img_path, img_data in images.items():
             img_bytes = decode_base64_image(img_data)
-            zip_file.writestr(f"{base_filename}_images/{img_path}", img_bytes)
+            zip_file.writestr(f"{images_dir}/{img_path}", img_bytes)
 
     zip_buffer.seek(0)
     return zip_buffer.getvalue()
@@ -771,7 +797,9 @@ def main():
                                 **options,
                             )
 
-                    markdown_text, images = extract_markdown_from_response(api_response)
+                    # Extract markdown with image paths rewritten to match ZIP structure
+                    base_filename = Path(uploaded_file.name).stem
+                    markdown_text, images = extract_markdown_from_response(api_response, base_filename)
 
                     processing_time = time.time() - start_time
                     st.success(f"✅ Processed in {processing_time:.1f} seconds")
@@ -916,12 +944,15 @@ def main():
                 for file_key, data in st.session_state.processing_results.items():
                     base_name = file_key.rsplit("_", 1)[0]  # Remove size suffix
                     base_name = Path(base_name).stem
+                    # Store each document in its own directory
                     batch_zip.writestr(
                         f"{base_name}/{base_name}.md", data["markdown"].encode("utf-8")
                     )
+                    # Images are stored to match markdown references: {base_name}_images/...
+                    images_dir = f"{base_name}_images"
                     for img_path, img_data in data["images"].items():
                         img_bytes = decode_base64_image(img_data)
-                        batch_zip.writestr(f"{base_name}/images/{img_path}", img_bytes)
+                        batch_zip.writestr(f"{base_name}/{images_dir}/{img_path}", img_bytes)
 
             batch_zip_buffer.seek(0)
             st.download_button(
