@@ -8,6 +8,7 @@ with vLLM backend for production-ready inference.
 import base64
 import io
 import os
+import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -50,6 +51,12 @@ VISUALIZE_RESULTS = os.getenv("VISUALIZE_RESULTS", "false").lower() == "true"
 
 # Supported file types
 SUPPORTED_EXTENSIONS = [".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp"]
+
+
+class CancellationError(Exception):
+    """Raised when processing is cancelled by the user."""
+
+    pass
 
 
 # HTTP Session with connection pooling for better performance
@@ -269,12 +276,17 @@ def process_single_page(args: tuple) -> tuple[int, dict | None, str | None]:
     Process a single PDF page. Helper function for parallel processing.
 
     Args:
-        args: Tuple of (page_num, page_content, filename, options)
+        args: Tuple of (page_num, page_content, filename, options, cancel_event)
 
     Returns:
         Tuple of (page_num, result_dict, error_message)
     """
-    page_num, page_content, filename, options = args
+    page_num, page_content, filename, options, cancel_event = args
+
+    # Check for cancellation before starting
+    if cancel_event and cancel_event.is_set():
+        return (page_num, None, "Cancelled")
+
     try:
         page_response = process_document(
             file_content=page_content,
@@ -292,6 +304,7 @@ def process_pdf_in_batches(
     file_content: bytes,
     filename: str,
     progress_callback=None,
+    cancel_event: threading.Event = None,
     max_workers: int = None,
     **options,
 ) -> dict:
@@ -302,11 +315,15 @@ def process_pdf_in_batches(
         file_content: Raw bytes of the PDF file
         filename: Original filename
         progress_callback: Optional callback function(completed_pages, total_pages)
+        cancel_event: Optional threading.Event to signal cancellation
         max_workers: Maximum parallel workers (default: MAX_PARALLEL_PAGES)
         **options: Processing options passed to process_document
 
     Returns:
         Combined API response dictionary with all pages
+
+    Raises:
+        CancellationError: If processing was cancelled by user
     """
     # Split PDF into individual pages
     page_contents = split_pdf_into_pages(file_content)
@@ -319,9 +336,9 @@ def process_pdf_in_batches(
     if max_workers is None:
         max_workers = MAX_PARALLEL_PAGES
 
-    # Prepare arguments for parallel processing
+    # Prepare arguments for parallel processing (include cancel_event)
     process_args = [
-        (page_num, page_content, filename, options)
+        (page_num, page_content, filename, options, cancel_event)
         for page_num, page_content in enumerate(page_contents)
     ]
 
@@ -329,6 +346,7 @@ def process_pdf_in_batches(
     results_dict = {}
     errors = []
     completed = 0
+    cancelled = False
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks
@@ -338,6 +356,14 @@ def process_pdf_in_batches(
 
         # Collect results as they complete
         for future in as_completed(future_to_page):
+            # Check for cancellation
+            if cancel_event and cancel_event.is_set():
+                cancelled = True
+                # Cancel remaining futures
+                for f in future_to_page:
+                    f.cancel()
+                break
+
             page_num, parsing_results, error = future.result()
             completed += 1
 
@@ -345,9 +371,18 @@ def process_pdf_in_batches(
                 progress_callback(completed, total_pages)
 
             if error:
-                errors.append(f"Page {page_num + 1}: {error}")
+                if error == "Cancelled":
+                    cancelled = True
+                else:
+                    errors.append(f"Page {page_num + 1}: {error}")
             elif parsing_results:
                 results_dict[page_num] = parsing_results
+
+    # Handle cancellation
+    if cancelled:
+        raise CancellationError(
+            f"Processing cancelled after {completed} of {total_pages} pages"
+        )
 
     # Report any errors
     if errors:
@@ -524,6 +559,10 @@ def main():
         st.session_state.processing_results = {}
     if "files_to_process" not in st.session_state:
         st.session_state.files_to_process = {}
+    if "cancel_requested" not in st.session_state:
+        st.session_state.cancel_requested = False
+    if "is_processing" not in st.session_state:
+        st.session_state.is_processing = False
 
     # Store uploaded files content for processing
     valid_files = []
@@ -559,25 +598,50 @@ def main():
     # Start OCR button
     st.header("🚀 Start Processing")
 
-    col1, col2 = st.columns([1, 3])
+    col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
         start_button = st.button(
             "🔍 Start OCR",
             type="primary",
-            width="stretch",
+            disabled=st.session_state.is_processing,
             help="Process all uploaded documents with OCR",
         )
     with col2:
+        cancel_button = st.button(
+            "⏹️ Cancel",
+            type="secondary",
+            disabled=not st.session_state.is_processing,
+            help="Cancel the current processing",
+        )
+    with col3:
         st.caption(f"Ready to process {len(valid_files)} document(s)")
+
+    # Handle cancel button
+    if cancel_button:
+        st.session_state.cancel_requested = True
+        st.warning("⏹️ Cancellation requested... waiting for current pages to finish.")
 
     if not start_button:
         st.info("👆 Click 'Start OCR' to begin processing your documents")
         return
 
+    # Reset cancel flag when starting new processing
+    st.session_state.cancel_requested = False
+    st.session_state.is_processing = True
+
     # Processing section
     st.header("🔄 Processing Results")
 
+    # Create a cancel event for thread communication
+    cancel_event = threading.Event()
+
     for uploaded_file, file_content in valid_files:
+        # Check for cancellation between files
+        if st.session_state.cancel_requested:
+            cancel_event.set()
+            st.warning("⏹️ Skipping remaining files due to cancellation.")
+            break
+
         file_key = f"{uploaded_file.name}_{uploaded_file.size}"
         is_pdf = uploaded_file.name.lower().endswith(".pdf")
 
@@ -595,11 +659,18 @@ def main():
                     if is_pdf:
                         # Use batch processing for PDFs to handle all pages
                         page_count = get_pdf_page_count(file_content)
-                        progress_bar = st.progress(
-                            0, text=f"Processing page 1/{page_count}..."
+
+                        # Create containers for progress and cancel status
+                        progress_container = st.empty()
+                        progress_bar = progress_container.progress(
+                            0,
+                            text=f"Processing page 0/{page_count}... (Cancel with button above)",
                         )
 
                         def update_progress(current, total):
+                            # Check cancel state from session
+                            if st.session_state.cancel_requested:
+                                cancel_event.set()
                             progress_bar.progress(
                                 current / total,
                                 text=f"Processing page {current}/{total}...",
@@ -609,9 +680,10 @@ def main():
                             file_content=file_content,
                             filename=uploaded_file.name,
                             progress_callback=update_progress,
+                            cancel_event=cancel_event,
                             **options,
                         )
-                        progress_bar.empty()
+                        progress_container.empty()
                     else:
                         # Process single image directly
                         with st.spinner(f"Processing {uploaded_file.name}..."):
@@ -642,6 +714,10 @@ def main():
                 except requests.RequestException as e:
                     st.error(f"🌐 Network error: {str(e)}")
                     continue
+                except CancellationError as e:
+                    st.warning(f"⏹️ {str(e)}")
+                    st.session_state.is_processing = False
+                    st.stop()  # Stop further processing
                 except RuntimeError as e:
                     st.error(f"❌ Processing error: {str(e)}")
                     continue
@@ -747,6 +823,10 @@ def main():
                 file_name="all_ocr_results.zip",
                 mime="application/zip",
             )
+
+    # Reset processing state
+    st.session_state.is_processing = False
+    st.session_state.cancel_requested = False
 
     # Footer
     st.markdown("---")
