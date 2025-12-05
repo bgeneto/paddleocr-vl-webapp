@@ -32,6 +32,7 @@ APP_DESCRIPTION = os.getenv(
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "50"))
 MAX_PARALLEL_PAGES = int(os.getenv("MAX_PARALLEL_PAGES", "8"))
+MAX_PREVIEW_PAGES = int(os.getenv("MAX_PREVIEW_PAGES", "10"))  # Limit preview rendering
 
 # PaddleOCR-VL API Configuration
 PADDLEOCR_VL_API_URL = os.getenv(
@@ -731,16 +732,45 @@ def main():
             )
 
             with tab_preview:
-                st.markdown(markdown_text)
+                # Count pages in markdown (separated by ---)
+                page_separators = markdown_text.count("\n\n---\n\n")
+                total_pages = page_separators + 1 if page_separators > 0 else 1
 
-                # Display embedded images if any
+                if total_pages > MAX_PREVIEW_PAGES:
+                    # Split by page separator and show only first N pages
+                    pages = markdown_text.split("\n\n---\n\n")
+                    truncated_md = "\n\n---\n\n".join(pages[:MAX_PREVIEW_PAGES])
+
+                    st.warning(
+                        f"⚠️ Showing preview of first {MAX_PREVIEW_PAGES} pages only "
+                        f"(document has {total_pages} pages). Use 'Raw Markdown' tab or download for full content."
+                    )
+                    st.markdown(truncated_md)
+
+                    # Optional: expandable full preview
+                    with st.expander(f"📄 Show all {total_pages} pages (may be slow)"):
+                        st.markdown(markdown_text)
+                else:
+                    st.markdown(markdown_text)
+
+                # Display embedded images if any (also limit images shown)
                 if images:
                     st.subheader("🖼️ Extracted Images")
-                    cols = st.columns(min(len(images), 3))
-                    for idx, (img_path, img_data) in enumerate(images.items()):
+                    max_images_preview = MAX_PREVIEW_PAGES * 3  # ~3 images per page max
+                    images_list = list(images.items())
+                    display_images = images_list[:max_images_preview]
+
+                    cols = st.columns(min(len(display_images), 3))
+                    for idx, (img_path, img_data) in enumerate(display_images):
                         with cols[idx % 3]:
                             img_bytes = decode_base64_image(img_data)
                             st.image(img_bytes, caption=img_path, width="stretch")
+
+                    if len(images_list) > max_images_preview:
+                        st.info(
+                            f"📷 Showing {max_images_preview} of {len(images_list)} images. "
+                            "Download ZIP for all images."
+                        )
 
             with tab_raw:
                 st.code(markdown_text, language="markdown")
