@@ -1,6 +1,7 @@
 # Git
 .git/
 .gitignore
+.github/
 
 # Environment files (use docker-compose env_file or build args)
 .env
