@@ -2,28 +2,30 @@
 # Adjust these settings if you encounter memory errors
 #
 # Common fixes for "No available memory for cache blocks":
-# 1. Increase gpu-memory-utilization (up to 0.98)
-# 2. Reduce max-num-seqs (try 32 or 16)
-# 3. Reduce max-model-len (try 2048)
-# 4. Enable enforce-eager (disable CUDA graphs)
+# 1. Increase gpu_memory_utilization (up to 0.98)
+# 2. Reduce max_num_seqs (try 32 or 16)
+# 3. Reduce max_model_len (try 2048)
+# 4. Enable enforce_eager (disable CUDA graphs)
+#
+# NOTE: vLLM uses underscores in YAML config keys, not hyphens!
 
 # GPU memory fraction to use (0.0-1.0)
 # Higher = more memory for model, less for KV cache
 # Try 0.98 if you still get memory errors
-gpu-memory-utilization: 0.85
+gpu_memory_utilization: 0.50
 
 # Maximum concurrent sequences
 # Reduce if OOM during inference (try 16 or 8 for low VRAM GPUs)
-max-num-seqs: 32
+max_num_seqs: 32
 
 # Maximum context length
 # Increase for longer documents, decrease if OOM
 # PaddleOCR-VL supports up to 32768 tokens
-max-model-len: 8192
+max_model_len: 8192
 
 # Disable CUDA graphs (uses less memory but slower)
-# Keep true for GPUs with limited VRAM
-enforce-eager: true
+# Set to true for GPUs with limited VRAM
+enforce_eager: false
 
 # Reduce batched tokens for memory savings
-max-num-batched-tokens: 8192
+max_num_batched_tokens: 8192
