@@ -293,8 +293,7 @@ def process_pdf_in_batches(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks
         future_to_page = {
-            executor.submit(process_single_page, args): args[0]
-            for args in process_args
+            executor.submit(process_single_page, args): args[0] for args in process_args
         }
 
         # Collect results as they complete
@@ -556,12 +555,14 @@ def main():
                     if is_pdf:
                         # Use batch processing for PDFs to handle all pages
                         page_count = get_pdf_page_count(file_content)
-                        progress_bar = st.progress(0, text=f"Processing page 1/{page_count}...")
+                        progress_bar = st.progress(
+                            0, text=f"Processing page 1/{page_count}..."
+                        )
 
                         def update_progress(current, total):
                             progress_bar.progress(
                                 current / total,
-                                text=f"Processing page {current}/{total}..."
+                                text=f"Processing page {current}/{total}...",
                             )
 
                         api_response = process_pdf_in_batches(
@@ -580,9 +581,7 @@ def main():
                                 **options,
                             )
 
-                    markdown_text, images = extract_markdown_from_response(
-                        api_response
-                    )
+                    markdown_text, images = extract_markdown_from_response(api_response)
 
                     processing_time = time.time() - start_time
                     st.success(f"✅ Processed in {processing_time:.1f} seconds")
@@ -592,7 +591,7 @@ def main():
                         "markdown": markdown_text,
                         "images": images,
                         "response": api_response,
-                        }
+                    }
 
                 except requests.Timeout:
                     st.error(
