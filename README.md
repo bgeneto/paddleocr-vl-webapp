@@ -105,8 +105,8 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `APP_TITLE` | PaddleOCR-VL Document Parser | Application title |
-| `MAX_FILE_SIZE_MB` | 50 | Maximum upload file size |
-| `MAX_PDF_PAGES` | 50 | Maximum PDF pages to process |
+| `MAX_FILE_SIZE_MB` | 99 | Maximum upload file size |
+| `MAX_PDF_PAGES` | 250 | Maximum PDF pages to process |
 | `API_TIMEOUT` | 300 | API request timeout in seconds |
 
 ### Processing Options

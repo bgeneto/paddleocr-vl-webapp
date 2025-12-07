@@ -29,10 +29,10 @@ APP_DESCRIPTION = os.getenv(
     "APP_DESCRIPTION",
     "Upload PDF or image files to convert them to Markdown using PaddleOCR-VL with vLLM backend",
 )
-MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
-MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "50"))
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "99"))
+MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "250"))
 # Parallel workers - keep low since API may serialize requests anyway
-MAX_PARALLEL_PAGES = int(os.getenv("MAX_PARALLEL_PAGES", "2"))
+MAX_PARALLEL_PAGES = int(os.getenv("MAX_PARALLEL_PAGES", "8"))
 MAX_PREVIEW_PAGES = int(os.getenv("MAX_PREVIEW_PAGES", "10"))  # Limit preview rendering
 # Pages per chunk - HIGHER = better GPU batching (vLLM processes all pages in chunk together)
 # This is the KEY setting for GPU utilization. Increase if you have enough VRAM.
