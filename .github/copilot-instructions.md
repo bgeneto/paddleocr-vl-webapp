@@ -17,7 +17,7 @@ Streamlit UI (app.py:8501) → PaddleOCR-VL API (:8080) → vLLM Inference Serve
 ### Environment-Based Configuration
 All settings come from environment variables with defaults. See lines 25-55 in `app.py`:
 ```python
-MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "99"))
 PAGES_PER_CHUNK = int(os.getenv("PAGES_PER_CHUNK", "16"))  # Critical for GPU batching
 ```
 
