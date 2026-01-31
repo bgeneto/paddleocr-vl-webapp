@@ -79,6 +79,8 @@ services:
     restart: unless-stopped
     environment:
       - VLM_BACKEND=${VLM_BACKEND:-vllm}
+    volumes:
+      - ./pipeline_config_${VLM_BACKEND:-vllm}.yaml:/home/paddleocr/pipeline_config_${VLM_BACKEND:-vllm}.yaml:ro
     command: /bin/bash -c "paddlex --serve --pipeline /home/paddleocr/pipeline_config_${VLM_BACKEND:-vllm}.yaml"
     depends_on:
       paddleocr-vlm-server:

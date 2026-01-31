@@ -69,7 +69,7 @@ A production-ready Streamlit application that processes PDF and image files usin
 
 ### 1. Clone and Navigate
 ```bash
-cd streamlit_ocr_app
+cd paddleocr-vl-webapp
 ```
 
 ### 2. Create Environment File
