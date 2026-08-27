@@ -12,17 +12,17 @@
 # GPU memory fraction to use (0.0-1.0)
 # Higher = more memory for model and KV cache = better batching
 # 0.90 is aggressive but safe for dedicated GPU
-gpu_memory_utilization: 0.55
+gpu_memory_utilization: 0.79
 
 # Maximum concurrent sequences - KEY for parallel page processing!
 # Higher = more pages processed simultaneously
 # Match or exceed MAX_PARALLEL_PAGES for best throughput
-max_num_seqs: 64
+max_num_seqs: 2
 
 # Maximum context length
 # PaddleOCR-VL supports up to 32768 tokens
 # 8192 is good for most documents (single-page)
-max_model_len: 32768
+max_model_len: 24576
 
 # Disable CUDA graphs (uses less memory but slower)
 # Keep false for best performance if you have enough VRAM
@@ -31,7 +31,7 @@ enforce_eager: false
 # Maximum batched tokens - controls throughput
 # Higher = more efficient GPU utilization
 # Should be >= max_model_len for optimal batching
-max_num_batched_tokens: 131072
+max_num_batched_tokens: 16384
 
 # Enable chunked prefill for better memory efficiency with long contexts
 enable_chunked_prefill: true
