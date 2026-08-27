@@ -6,12 +6,16 @@ with vLLM backend for production-ready inference.
 """
 
 import base64
+import hashlib
 import io
+import json
+import logging
 import os
 import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 
 import fitz  # PyMuPDF for PDF preview
@@ -56,6 +60,152 @@ VISUALIZE_RESULTS = os.getenv("VISUALIZE_RESULTS", "false").lower() == "true"
 
 # Supported file types
 SUPPORTED_EXTENSIONS = [".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp"]
+
+# =============================================================================
+# Persistence / result cache
+# =============================================================================
+# Successful results are stored under DATA_DIR, keyed by the SHA-256 of the
+# file content and a fingerprint of the six processing options:
+#   DATA_DIR/<sha256>/<options-fingerprint>/{meta.json,result.md,result.zip}
+# Re-uploading a byte-identical file with the same options is served instantly
+# from disk (no API call). The directory survives container recreation via the
+# ./data bind mount (see compose.yaml).
+DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).resolve().parent / "data")))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+logger = logging.getLogger(__name__)
+
+# (option key, short name) pairs in fixed order; defines the fingerprint format
+_OPTION_FINGERPRINT_KEYS = (
+    ("use_doc_orientation_classify", "orient"),
+    ("use_doc_unwarping", "unwarp"),
+    ("use_layout_detection", "layout"),
+    ("use_chart_recognition", "chart"),
+    ("prettify_markdown", "pretty"),
+    ("visualize", "vis"),
+)
+
+
+def compute_sha256(content: bytes) -> str:
+    """Compute the SHA-256 hex digest of file content (already fully in memory)."""
+    return hashlib.sha256(content).hexdigest()
+
+
+def options_fingerprint(options: dict) -> str:
+    """Deterministic compact fingerprint of the six processing options.
+
+    Example: 'orient=1_unwarp=0_layout=1_chart=0_pretty=1_vis=0'. Key order is
+    fixed here, so the ordering of the caller's dict does not matter.
+    """
+    return "_".join(
+        f"{short}={'1' if options.get(key) else '0'}"
+        for key, short in _OPTION_FINGERPRINT_KEYS
+    )
+
+
+def cache_dirs(hash_str: str, fingerprint: str) -> Path:
+    """Return (creating if needed) the cache entry directory for a pair."""
+    entry_dir = DATA_DIR / hash_str / fingerprint
+    entry_dir.mkdir(parents=True, exist_ok=True)
+    return entry_dir
+
+
+def display_stem(display_name: str) -> str:
+    """Sanitized base name used for artifact filenames and ZIP structure."""
+    return Path(display_name).stem.strip() or "document"
+
+
+def _atomic_write_bytes(target: Path, data: bytes) -> None:
+    """Write bytes to a temp file in the same directory, then rename into place."""
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, target)
+
+
+def save_result_to_disk(
+    hash_str: str,
+    fingerprint: str,
+    display_name: str,
+    markdown_text: str,
+    images: dict,
+    page_count: int,
+    options: dict,
+) -> None:
+    """Persist a successful result so re-uploads can be served instantly.
+
+    Never raises: a storage failure must not break a successful in-memory
+    result (logged + surfaced as a warning instead). All files are written
+    atomically (temp file + rename).
+    """
+    try:
+        entry_dir = cache_dirs(hash_str, fingerprint)
+        stem = display_stem(display_name)
+        now = datetime.now(timezone.utc).isoformat()
+
+        zip_bytes = create_download_zip(markdown_text, images, stem)
+        md_bytes = markdown_text.encode("utf-8")
+        meta = {
+            "display_name": display_name,
+            "hash": hash_str,
+            "fingerprint": fingerprint,
+            "options": {key: bool(options.get(key)) for key, _ in _OPTION_FINGERPRINT_KEYS},
+            "page_count": page_count,
+            "created_at": now,
+            "updated_at": now,
+            "sizes": {"md": len(md_bytes), "zip": len(zip_bytes)},
+        }
+
+        _atomic_write_bytes(entry_dir / "result.md", md_bytes)
+        _atomic_write_bytes(entry_dir / "result.zip", zip_bytes)
+        _atomic_write_bytes(
+            entry_dir / "meta.json", json.dumps(meta, indent=2).encode("utf-8")
+        )
+    except Exception as e:
+        logger.warning(
+            "Failed to save result to disk cache (%s/%s): %s", hash_str, fingerprint, e
+        )
+        try:
+            st.warning(f"⚠️ Could not persist result to disk cache: {e}")
+        except Exception:
+            pass
+
+
+def load_cached_result(hash_str: str, fingerprint: str) -> dict | None:
+    """Load a previously stored result, or None on any miss or corruption.
+
+    On a hit, reconstructs the same shape used by the in-memory session cache:
+    {'markdown', 'images', 'display_name', 'from_disk_cache', 'fingerprint'},
+    where images keys are the relative paths ('page_N/file' or 'file') matching
+    extract_markdown_from_response, with base64 values. Corrupt or partial
+    entries are treated as misses and left on disk for inspection.
+    """
+    try:
+        entry_dir = DATA_DIR / hash_str / fingerprint
+        meta = json.loads((entry_dir / "meta.json").read_text(encoding="utf-8"))
+        markdown_text = (entry_dir / "result.md").read_text(encoding="utf-8")
+        stem = display_stem(meta["display_name"])
+        images_prefix = f"{stem}_images/"
+
+        images = {}
+        with zipfile.ZipFile(entry_dir / "result.zip", "r") as zf:
+            names = set(zf.namelist())
+            if f"{stem}.md" not in names:
+                raise ValueError(f"zip is missing the {stem}.md member")
+            for name in names:
+                if name.startswith(images_prefix) and not name.endswith("/"):
+                    data = zf.read(name)
+                    images[name[len(images_prefix):]] = base64.b64encode(data).decode("ascii")
+
+        return {
+            "markdown": markdown_text,
+            "images": images,
+            "display_name": meta["display_name"],
+            "from_disk_cache": True,
+            "fingerprint": fingerprint,
+        }
+    except Exception as e:
+        logger.warning("Disk cache miss (%s/%s): %s", hash_str, fingerprint, e)
+        return None
 
 
 class CancellationError(Exception):
@@ -643,6 +793,8 @@ def main():
 
     # Processing options
     options = display_processing_options()
+    # Fingerprint of the current options; identical file + options share one cache entry
+    options_fp = options_fingerprint(options)
 
     # File upload section
     st.header("📤 Upload Documents")
@@ -678,7 +830,8 @@ def main():
 
         file_content = uploaded_file.read()
         uploaded_file.seek(0)
-        valid_files.append((uploaded_file, file_content))
+        file_hash = compute_sha256(file_content)
+        valid_files.append((uploaded_file, file_content, file_hash))
 
     if not valid_files:
         return
@@ -687,7 +840,7 @@ def main():
     st.header("👁️ Document Preview")
     st.caption("Review your documents before processing")
 
-    for uploaded_file, file_content in valid_files:
+    for uploaded_file, file_content, file_hash in valid_files:
         file_key = f"{uploaded_file.name}_{uploaded_file.size}"
 
         with st.expander(f"📄 {uploaded_file.name}", expanded=True):
@@ -697,6 +850,8 @@ def main():
             st.session_state.files_to_process[file_key] = {
                 "name": uploaded_file.name,
                 "content": file_content,
+                "hash": file_hash,
+                "fingerprint": options_fp,
             }
 
     # Start OCR button
@@ -739,7 +894,7 @@ def main():
     # Create a cancel event for thread communication
     cancel_event = threading.Event()
 
-    for uploaded_file, file_content in valid_files:
+    for uploaded_file, file_content, file_hash in valid_files:
         # Check for cancellation between files
         if st.session_state.cancel_requested:
             cancel_event.set()
@@ -750,15 +905,31 @@ def main():
         is_pdf = uploaded_file.name.lower().endswith(".pdf")
 
         with st.expander(f"📄 {uploaded_file.name}", expanded=True):
-            # Check if already processed
-            if file_key in st.session_state.processing_results:
-                cached = st.session_state.processing_results[file_key]
-                st.info("📋 Using cached results. Re-upload to reprocess.")
+            # Session cache is keyed by name+size; only reuse when options match.
+            # A fingerprint mismatch falls through to disk cache / reprocess.
+            cached = st.session_state.processing_results.get(file_key)
+            if cached is not None and cached.get("fingerprint") == options_fp:
+                if cached.get("from_disk_cache"):
+                    st.info(
+                        "📋 Using results restored from the disk cache (persisted from a previous run). "
+                        "Change the processing options to reprocess."
+                    )
+                else:
+                    st.info("📋 Using cached results. Re-upload to reprocess.")
                 markdown_text = cached["markdown"]
                 images = cached["images"]
+            elif (disk_hit := load_cached_result(file_hash, options_fp)) is not None:
+                # Stored on disk from an earlier run - serve instantly, no API call
+                st.session_state.processing_results[file_key] = disk_hit
+                st.success(
+                    "⚡ Instant from disk cache — file previously processed with these options"
+                )
+                markdown_text = disk_hit["markdown"]
+                images = disk_hit["images"]
             else:
                 try:
                     start_time = time.time()
+                    page_count = 0
 
                     if is_pdf:
                         # Use batch processing for PDFs to handle all pages
@@ -790,6 +961,7 @@ def main():
                         progress_container.empty()
                     else:
                         # Process single image directly
+                        page_count = 1
                         with st.spinner(f"Processing {uploaded_file.name}..."):
                             api_response = process_document(
                                 file_content=file_content,
@@ -798,18 +970,31 @@ def main():
                             )
 
                     # Extract markdown with image paths rewritten to match ZIP structure
-                    base_filename = Path(uploaded_file.name).stem
+                    base_filename = display_stem(uploaded_file.name)
                     markdown_text, images = extract_markdown_from_response(api_response, base_filename)
 
                     processing_time = time.time() - start_time
                     st.success(f"✅ Processed in {processing_time:.1f} seconds")
 
-                    # Cache results
+                    # Cache results (fingerprint so option changes miss this entry)
                     st.session_state.processing_results[file_key] = {
                         "markdown": markdown_text,
                         "images": images,
                         "response": api_response,
+                        "display_name": uploaded_file.name,
+                        "fingerprint": options_fp,
                     }
+
+                    # Persist to disk for instant serving on re-upload (never raises)
+                    save_result_to_disk(
+                        hash_str=file_hash,
+                        fingerprint=options_fp,
+                        display_name=uploaded_file.name,
+                        markdown_text=markdown_text,
+                        images=images,
+                        page_count=page_count,
+                        options=options,
+                    )
 
                 except requests.Timeout:
                     st.error(
@@ -881,7 +1066,13 @@ def main():
                 st.code(markdown_text, language="markdown")
 
             with tab_download:
-                base_filename = Path(uploaded_file.name).stem
+                # Download names come from the display name stored with the
+                # result (the original upload name for disk-cache hits)
+                base_filename = display_stem(
+                    st.session_state.processing_results[file_key].get(
+                        "display_name", uploaded_file.name
+                    )
+                )
 
                 col1, col2 = st.columns(2)
 
@@ -912,26 +1103,32 @@ def main():
             # Display visualization if enabled and available
             if options["visualize"] and file_key in st.session_state.processing_results:
                 cached = st.session_state.processing_results[file_key]
-                response = cached.get("response", {})
-                result = response.get("result", {})
-                parsing_results = result.get("layoutParsingResults", [])
+                if cached.get("from_disk_cache"):
+                    st.caption(
+                        "🔍 Visualization images are not stored in the disk cache. "
+                        "Reprocess the file to view them."
+                    )
+                else:
+                    response = cached.get("response", {})
+                    result = response.get("result", {})
+                    parsing_results = result.get("layoutParsingResults", [])
 
-                for page_result in parsing_results:
-                    output_images = page_result.get("outputImages", {})
-                    if output_images:
-                        st.subheader("🔍 Processing Visualization")
-                        vis_cols = st.columns(min(len(output_images), 2))
-                        for idx, (img_name, img_data) in enumerate(
-                            output_images.items()
-                        ):
-                            if img_data:
-                                with vis_cols[idx % 2]:
-                                    img_bytes = decode_base64_image(img_data)
-                                    st.image(
-                                        img_bytes,
-                                        caption=img_name.replace("_", " ").title(),
-                                        width="stretch",
-                                    )
+                    for page_result in parsing_results:
+                        output_images = page_result.get("outputImages", {})
+                        if output_images:
+                            st.subheader("🔍 Processing Visualization")
+                            vis_cols = st.columns(min(len(output_images), 2))
+                            for idx, (img_name, img_data) in enumerate(
+                                output_images.items()
+                            ):
+                                if img_data:
+                                    with vis_cols[idx % 2]:
+                                        img_bytes = decode_base64_image(img_data)
+                                        st.image(
+                                            img_bytes,
+                                            caption=img_name.replace("_", " ").title(),
+                                            width="stretch",
+                                        )
 
     # Batch download section
     if len(st.session_state.processing_results) > 1:
@@ -942,8 +1139,9 @@ def main():
                 batch_zip_buffer, "w", zipfile.ZIP_DEFLATED
             ) as batch_zip:
                 for file_key, data in st.session_state.processing_results.items():
-                    base_name = file_key.rsplit("_", 1)[0]  # Remove size suffix
-                    base_name = Path(base_name).stem
+                    base_name = display_stem(
+                        data.get("display_name", file_key.rsplit("_", 1)[0])
+                    )
                     # Store each document in its own directory
                     batch_zip.writestr(
                         f"{base_name}/{base_name}.md", data["markdown"].encode("utf-8")

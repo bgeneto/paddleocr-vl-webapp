@@ -65,3 +65,7 @@ Thumbs.db
 # Uploaded files
 uploads/
 *.Identifier
+
+# Processed results cache (keep the .gitkeep placeholder tracked)
+data/*
+!data/.gitkeep

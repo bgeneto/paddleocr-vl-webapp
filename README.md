@@ -128,6 +128,33 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 | `API_IMAGE_TAG_SUFFIX` | latest-offline | Docker image tag |
 | `VLM_IMAGE_TAG_SUFFIX` | latest-offline | VLM image tag |
 
+## Persistence & Caching
+
+Processed results are persisted to a `data/` directory on the host (bind-mounted into the container at `/app/data`), organized as:
+
+```
+data/
+└── <sha256-of-file-content>/
+    └── <options-fingerprint>/     # e.g. orient=0_unwarp=0_layout=1_chart=0_pretty=1_vis=0
+        ├── meta.json              # display name, hash, options, page count, timestamps, sizes
+        ├── result.md              # extracted markdown
+        └── result.zip             # {stem}.md + {stem}_images/... (same layout as the download button)
+```
+
+- **Instant re-uploads**: re-uploading a byte-identical file (matched by SHA-256) with the same sidebar options serves the stored result instantly — no API call.
+- **Changed options**: different sidebar options produce a different fingerprint directory, so the document is reprocessed and the new entry is stored alongside the previous ones.
+- **Survives restarts**: the cache lives on the host bind mount, so `docker compose down && up -d` does not lose it.
+- **Visualizations**: the Visualizations tab is not available for results restored from the disk cache (only markdown + ZIP are persisted). Reprocess the file to view them.
+- **Cleanup**: entries are never evicted automatically. Inspect and clean up manually:
+
+```bash
+du -sh data/                              # total cache size
+rm -rf data/<sha256>/                     # remove all option variants for one file
+rm -rf data/<sha256>/<fingerprint>/       # remove a single options variant
+```
+
+The location can be changed with the `DATA_DIR` environment variable (see `.env.example`). Its default is `./data` next to the app (`/app/data` inside Docker, `<repo>/data` for local runs).
+
 ## Usage
 
 ### Web Interface
@@ -212,6 +239,8 @@ pip install -r requirements.txt
 PADDLEOCR_VL_API_URL=http://your-api-host:8080/layout-parsing streamlit run app.py
 ```
 
+> **Note**: For local runs, `DATA_DIR` defaults to `<repo>/data` (gitignored), so the results cache works outside Docker too. Set `DATA_DIR` to use a different location.
+
 ### Building Custom Images
 ```bash
 # Build Streamlit frontend
@@ -236,6 +265,7 @@ streamlit_ocr_app/
 ├── .env                   # Local configuration (not in git)
 ├── .gitignore             # Git ignore rules
 ├── .dockerignore          # Docker build ignore rules
+├── data/                  # Processed results cache (gitignored, bind-mounted in Docker)
 ├── README.md              # This file
 └── logs/                  # Application logs
 ```

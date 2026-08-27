@@ -35,8 +35,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy application code
 COPY app.py .
 
-# Create directories for logs and temp files
-RUN mkdir -p /app/logs /tmp/uploads && \
+# Create directories for logs, data (results cache), and temp files
+RUN mkdir -p /app/logs /app/data /tmp/uploads && \
     chown -R appuser:appuser /app /tmp/uploads
 
 # Switch to non-root user

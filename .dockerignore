@@ -66,3 +66,6 @@ test_*.py
 
 # Uploaded files
 uploads/
+
+# Processed results cache (never bake host data into the image)
+data/

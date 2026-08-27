@@ -41,6 +41,8 @@ services:
       - MAX_PARALLEL_PAGES=${MAX_PARALLEL_PAGES:-2}
       - MAX_PREVIEW_PAGES=${MAX_PREVIEW_PAGES:-10}
       - PAGES_PER_CHUNK=${PAGES_PER_CHUNK:-16}
+      # Storage / Caching (persisted results keyed by file hash + options)
+      - DATA_DIR=${DATA_DIR:-/app/data}
       # Processing Options
       - USE_DOC_ORIENTATION_CLASSIFY=${USE_DOC_ORIENTATION_CLASSIFY:-false}
       - USE_DOC_UNWARPING=${USE_DOC_UNWARPING:-false}
@@ -51,6 +53,7 @@ services:
     volumes:
       - ./app.py:/app/app.py:ro
       - ./logs:/app/logs
+      - ./data:/app/data
     depends_on:
       paddleocr-vl-api:
         condition: service_healthy
@@ -122,10 +125,6 @@ services:
       start_period: 300s
     networks:
       - ocr-network
-
-volumes:
-  uploads:
-    driver: local
 
 networks:
   ocr-network:
