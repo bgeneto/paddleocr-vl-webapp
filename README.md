@@ -136,14 +136,18 @@ Processed results are persisted to a `data/` directory on the host (bind-mounted
 data/
 └── <sha256-of-file-content>/
     └── <options-fingerprint>/     # e.g. orient=0_unwarp=0_layout=1_chart=0_pretty=1_vis=0
-        ├── meta.json              # display name, hash, options, page count, timestamps, sizes
-        ├── result.md              # extracted markdown
+        ├── meta.json              # display name, hash, options, page count, status, timestamps, sizes
+        ├── pages/                 # incremental PDF checkpoints (one JSON file per completed page)
+        │   ├── 0000.json
+        │   └── 0001.json
+        ├── result.md              # extracted markdown (written when the job finishes)
         └── result.zip             # {stem}.md + {stem}_images/... (same layout as the download button)
 ```
 
 - **Instant re-uploads**: re-uploading a byte-identical file (matched by SHA-256) with the same sidebar options serves the stored result instantly — no API call.
-- **Changed options**: different sidebar options produce a different fingerprint directory, so the document is reprocessed and the new entry is stored alongside the previous ones.
-- **Survives restarts**: the cache lives on the host bind mount, so `docker compose down && up -d` does not lose it.
+- **Changed options**: different sidebar options produce a different fingerprint directory, so the document is reprocessed and the new entry is stored alongside the previous ones. Partial progress from the previous options is not reused.
+- **Interrupt / resume**: PDF jobs checkpoint each completed chunk (the pages in one API request) under `pages/`. If OCR is interrupted — vLLM/API crash, timeout, cancel, browser/tab close, or container restart — click **Start OCR** again with the same file and the same options. Already-OCR'd pages are skipped; only the remaining pages are sent to the API. A chunk that was in-flight when the API died is retried as a whole (that request is atomic). Closing the browser does **not** keep the original run going in the background; it only preserves completed pages so the next Start OCR can continue.
+- **Survives restarts**: the cache lives on the host bind mount, so `docker compose down && up -d` does not lose it (including partial `pages/` checkpoints).
 - **Visualizations**: the Visualizations tab is not available for results restored from the disk cache (only markdown + ZIP are persisted). Reprocess the file to view them.
 - **Cleanup**: entries are never evicted automatically. Inspect and clean up manually:
 

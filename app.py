@@ -66,10 +66,12 @@ SUPPORTED_EXTENSIONS = [".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp
 # =============================================================================
 # Successful results are stored under DATA_DIR, keyed by the SHA-256 of the
 # file content and a fingerprint of the six processing options:
-#   DATA_DIR/<sha256>/<options-fingerprint>/{meta.json,result.md,result.zip}
+#   DATA_DIR/<sha256>/<options-fingerprint>/{meta.json,result.md,result.zip,pages/}
 # Re-uploading a byte-identical file with the same options is served instantly
-# from disk (no API call). The directory survives container recreation via the
-# ./data bind mount (see compose.yaml).
+# from disk (no API call). In-progress PDF jobs also checkpoint each completed
+# page under pages/{n:04d}.json so a later Start OCR can skip already-OCR'd
+# pages. The directory survives container recreation via the ./data bind mount
+# (see compose.yaml).
 DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).resolve().parent / "data")))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -144,13 +146,24 @@ def save_result_to_disk(
 
         zip_bytes = create_download_zip(markdown_text, images, stem)
         md_bytes = markdown_text.encode("utf-8")
+        created_at = now
+        meta_path = entry_dir / "meta.json"
+        if meta_path.is_file():
+            try:
+                created_at = (
+                    json.loads(meta_path.read_text(encoding="utf-8")).get("created_at")
+                    or now
+                )
+            except Exception:
+                pass
         meta = {
             "display_name": display_name,
             "hash": hash_str,
             "fingerprint": fingerprint,
             "options": {key: bool(options.get(key)) for key, _ in _OPTION_FINGERPRINT_KEYS},
             "page_count": page_count,
-            "created_at": now,
+            "status": "complete",
+            "created_at": created_at,
             "updated_at": now,
             "sizes": {"md": len(md_bytes), "zip": len(zip_bytes)},
         }
@@ -179,8 +192,16 @@ def load_cached_result(hash_str: str, fingerprint: str) -> dict | None:
     extract_markdown_from_response, with base64 values. Corrupt or partial
     entries are treated as misses and left on disk for inspection.
     """
+    entry_dir = DATA_DIR / hash_str / fingerprint
+    # Incomplete checkpoints (pages/*.json only) are not a full hit; resume
+    # happens in process_pdf_in_batches. Avoid logging those as cache misses.
+    if not all(
+        (entry_dir / name).is_file()
+        for name in ("meta.json", "result.md", "result.zip")
+    ):
+        return None
+
     try:
-        entry_dir = DATA_DIR / hash_str / fingerprint
         meta = json.loads((entry_dir / "meta.json").read_text(encoding="utf-8"))
         markdown_text = (entry_dir / "result.md").read_text(encoding="utf-8")
         stem = display_stem(meta["display_name"])
@@ -206,6 +227,103 @@ def load_cached_result(hash_str: str, fingerprint: str) -> dict | None:
     except Exception as e:
         logger.warning("Disk cache miss (%s/%s): %s", hash_str, fingerprint, e)
         return None
+
+
+def pages_cache_dir(hash_str: str, fingerprint: str) -> Path:
+    """Directory for per-page OCR checkpoints of a cache entry."""
+    return cache_dirs(hash_str, fingerprint) / "pages"
+
+
+def page_result_path(hash_str: str, fingerprint: str, page_num: int) -> Path:
+    """Path to the JSON checkpoint for a 0-indexed page."""
+    return pages_cache_dir(hash_str, fingerprint) / f"{page_num:04d}.json"
+
+
+def save_page_result(
+    hash_str: str, fingerprint: str, page_num: int, parsing_result: dict
+) -> None:
+    """Atomically persist one page's layoutParsingResults item. Never raises."""
+    try:
+        pages_dir = pages_cache_dir(hash_str, fingerprint)
+        pages_dir.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(parsing_result, ensure_ascii=False).encode("utf-8")
+        _atomic_write_bytes(page_result_path(hash_str, fingerprint, page_num), payload)
+    except Exception as e:
+        logger.warning(
+            "Failed to save page %s checkpoint (%s/%s): %s",
+            page_num,
+            hash_str,
+            fingerprint,
+            e,
+        )
+
+
+def load_completed_pages(hash_str: str, fingerprint: str) -> dict[int, dict]:
+    """Load valid per-page checkpoints. Corrupt files are skipped (will be re-OCR'd).
+
+    The pages/ directory is the source of truth for resume progress — not meta.json.
+    """
+    results: dict[int, dict] = {}
+    pages_dir = DATA_DIR / hash_str / fingerprint / "pages"
+    if not pages_dir.is_dir():
+        return results
+
+    for path in pages_dir.glob("*.json"):
+        try:
+            page_num = int(path.stem)
+        except ValueError:
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("Skipping corrupt page checkpoint %s: %s", path, e)
+            continue
+        if isinstance(payload, dict):
+            results[page_num] = payload
+        else:
+            logger.warning("Skipping invalid page checkpoint %s: not an object", path)
+    return results
+
+
+def write_partial_meta(
+    hash_str: str,
+    fingerprint: str,
+    display_name: str,
+    page_count: int,
+    options: dict,
+) -> None:
+    """Mark a cache entry as an in-progress PDF job. Never raises.
+
+    Not the source of truth for which pages are done (see pages/*.json).
+    """
+    try:
+        entry_dir = cache_dirs(hash_str, fingerprint)
+        now = datetime.now(timezone.utc).isoformat()
+        created_at = now
+        meta_path = entry_dir / "meta.json"
+        if meta_path.is_file():
+            try:
+                created_at = (
+                    json.loads(meta_path.read_text(encoding="utf-8")).get("created_at")
+                    or now
+                )
+            except Exception:
+                pass
+        meta = {
+            "display_name": display_name,
+            "hash": hash_str,
+            "fingerprint": fingerprint,
+            "options": {key: bool(options.get(key)) for key, _ in _OPTION_FINGERPRINT_KEYS},
+            "page_count": page_count,
+            "status": "partial",
+            "created_at": created_at,
+            "updated_at": now,
+        }
+        _atomic_write_bytes(meta_path, json.dumps(meta, indent=2).encode("utf-8"))
+    except Exception as e:
+        logger.warning(
+            "Failed to write partial meta (%s/%s): %s", hash_str, fingerprint, e
+        )
 
 
 class CancellationError(Exception):
@@ -372,6 +490,23 @@ def split_pdf_into_chunks(
     return chunks
 
 
+def extract_pdf_pages(file_content: bytes, page_indices: list[int]) -> bytes:
+    """Build a PDF containing the given 0-indexed pages, in that order."""
+    if not page_indices:
+        raise ValueError("page_indices must not be empty")
+    try:
+        doc = fitz.open(stream=file_content, filetype="pdf")
+        chunk_doc = fitz.open()
+        for page_num in page_indices:
+            chunk_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
+        chunk_bytes = chunk_doc.tobytes()
+        chunk_doc.close()
+        doc.close()
+        return chunk_bytes
+    except Exception as e:
+        raise RuntimeError(f"Failed to extract PDF pages {page_indices}: {e}")
+
+
 def split_pdf_into_pages(file_content: bytes) -> list[bytes]:
     """Split a PDF into individual single-page PDFs (legacy, for small PDFs)."""
     pages = []
@@ -469,25 +604,38 @@ def process_document(
     return response.json()
 
 
-def process_chunk(args: tuple) -> tuple[int, int, list | None, str | None]:
+def process_chunk(args: tuple) -> tuple[int, list[int], list | None, str | None]:
     """
     Process a chunk of PDF pages. Helper function for parallel chunk processing.
 
     Each chunk contains multiple pages, which allows vLLM to batch-process them
-    together for better GPU utilization.
+    together for better GPU utilization. On success, each page is checkpointed
+    to disk immediately (in this worker) so a crash of the Streamlit run still
+    preserves completed pages.
 
     Args:
-        args: Tuple of (chunk_index, start_page, end_page, chunk_content, filename, options, cancel_event)
+        args: Tuple of (chunk_index, page_indices, chunk_content, filename,
+            options, cancel_event, file_hash, fingerprint). page_indices are
+            0-indexed original PDF page numbers, in the same order as pages
+            in chunk_content.
 
     Returns:
-        Tuple of (chunk_index, start_page, parsing_results_list, error_message)
+        Tuple of (chunk_index, page_indices, parsing_results_list, error_message)
     """
-    chunk_index, start_page, end_page, chunk_content, filename, options, cancel_event = args
-    num_pages_in_chunk = end_page - start_page + 1
+    (
+        chunk_index,
+        page_indices,
+        chunk_content,
+        filename,
+        options,
+        cancel_event,
+        file_hash,
+        fingerprint,
+    ) = args
 
     # Check for cancellation before starting
     if cancel_event and cancel_event.is_set():
-        return (chunk_index, start_page, None, "Cancelled")
+        return (chunk_index, page_indices, None, "Cancelled")
 
     try:
         # Send multi-page chunk to API - vLLM will batch-process all pages together
@@ -499,10 +647,23 @@ def process_chunk(args: tuple) -> tuple[int, int, list | None, str | None]:
         result = chunk_response.get("result", {})
         parsing_results = result.get("layoutParsingResults", [])
 
-        # Each parsing result corresponds to a page in the chunk
-        return (chunk_index, start_page, parsing_results, None)
+        if not parsing_results or len(parsing_results) != len(page_indices):
+            got = 0 if not parsing_results else len(parsing_results)
+            return (
+                chunk_index,
+                page_indices,
+                None,
+                f"Expected {len(page_indices)} page results, got {got}",
+            )
+
+        # Persist before returning so a dying main thread does not lose this chunk
+        if file_hash and fingerprint:
+            for page_num, page_result in zip(page_indices, parsing_results):
+                save_page_result(file_hash, fingerprint, page_num, page_result)
+
+        return (chunk_index, page_indices, parsing_results, None)
     except Exception as e:
-        return (chunk_index, start_page, None, str(e))
+        return (chunk_index, page_indices, None, str(e))
 
 
 def process_pdf_in_batches(
@@ -512,6 +673,8 @@ def process_pdf_in_batches(
     cancel_event: threading.Event = None,
     max_workers: int = None,
     pages_per_chunk: int = None,
+    file_hash: str | None = None,
+    fingerprint: str | None = None,
     **options,
 ) -> dict:
     """
@@ -522,6 +685,9 @@ def process_pdf_in_batches(
     vLLM to batch-process all pages in the chunk together. This dramatically improves
     GPU utilization compared to single-page processing.
 
+    When file_hash and fingerprint are provided, completed pages are checkpointed
+    under DATA_DIR and skipped on subsequent runs (resume after interrupt).
+
     Args:
         file_content: Raw bytes of the PDF file
         filename: Original filename
@@ -529,6 +695,8 @@ def process_pdf_in_batches(
         cancel_event: Optional threading.Event to signal cancellation
         max_workers: Maximum parallel chunk workers (default: MAX_PARALLEL_PAGES)
         pages_per_chunk: Pages per chunk for GPU batching (default: PAGES_PER_CHUNK)
+        file_hash: SHA-256 of file content, used as the cache key
+        fingerprint: Options fingerprint, used as the cache key
         **options: Processing options passed to process_document
 
     Returns:
@@ -548,93 +716,115 @@ def process_pdf_in_batches(
     if total_pages == 0:
         raise RuntimeError("PDF has no pages or could not be read")
 
-    # For small PDFs, adjust chunk size to avoid overhead
-    # e.g., 12 pages with chunk=8 → better to do 6+6 than 8+4
-    num_chunks = (total_pages + pages_per_chunk - 1) // pages_per_chunk
+    # Resume from per-page checkpoints (source of truth is pages/*.json)
+    cached_pages: dict[int, dict] = {}
+    if file_hash and fingerprint:
+        cached_pages = {
+            page_num: result
+            for page_num, result in load_completed_pages(file_hash, fingerprint).items()
+            if 0 <= page_num < total_pages
+        }
+
+    results_dict: dict[int, dict] = dict(cached_pages)
+    missing_pages = [i for i in range(total_pages) if i not in results_dict]
+
+    if progress_callback:
+        progress_callback(len(results_dict), total_pages)
+
+    if not missing_pages:
+        all_parsing_results = [results_dict[p] for p in range(total_pages)]
+        return {
+            "errorCode": 0,
+            "errorMsg": "Success",
+            "result": {"layoutParsingResults": all_parsing_results},
+        }
+
+    if file_hash and fingerprint:
+        write_partial_meta(
+            file_hash, fingerprint, filename, total_pages, options
+        )
+
+    # Evenly distribute remaining pages across chunks (same idea as a full run)
+    n_missing = len(missing_pages)
+    num_chunks = (n_missing + pages_per_chunk - 1) // pages_per_chunk
     if num_chunks > 1:
-        # Distribute pages more evenly across chunks
-        adjusted_chunk_size = (total_pages + num_chunks - 1) // num_chunks
+        adjusted_chunk_size = (n_missing + num_chunks - 1) // num_chunks
         pages_per_chunk = max(1, adjusted_chunk_size)
 
-    # Split PDF into multi-page chunks
-    chunks = split_pdf_into_chunks(file_content, pages_per_chunk)
-    num_chunks = len(chunks)
+    process_args = []
+    for chunk_idx, offset in enumerate(range(0, n_missing, pages_per_chunk)):
+        page_indices = missing_pages[offset : offset + pages_per_chunk]
+        chunk_bytes = extract_pdf_pages(file_content, page_indices)
+        process_args.append(
+            (
+                chunk_idx,
+                page_indices,
+                chunk_bytes,
+                filename,
+                options,
+                cancel_event,
+                file_hash,
+                fingerprint,
+            )
+        )
 
-    # Prepare arguments for parallel chunk processing
-    process_args = [
-        (chunk_idx, start_page, end_page, chunk_bytes, filename, options, cancel_event)
-        for chunk_idx, (start_page, end_page, chunk_bytes) in enumerate(chunks)
-    ]
-
-    # Process chunks in parallel (each chunk is batch-processed by vLLM)
-    results_dict = {}  # page_num -> parsing_result
     errors = []
-    completed_pages = 0
     cancelled = False
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all chunk tasks
         future_to_chunk = {
-            executor.submit(process_chunk, args): (args[0], args[1], args[2])  # chunk_idx, start, end
+            executor.submit(process_chunk, args): args[1]  # page_indices
             for args in process_args
         }
 
-        # Collect results as chunks complete
         for future in as_completed(future_to_chunk):
-            # Check for cancellation
             if cancel_event and cancel_event.is_set():
                 cancelled = True
                 for f in future_to_chunk:
                     f.cancel()
                 break
 
-            chunk_idx, start_page, parsing_results, error = future.result()
-            _, chunk_start, chunk_end = future_to_chunk[future]
-            pages_in_chunk = chunk_end - chunk_start + 1
-            completed_pages += pages_in_chunk
-
-            if progress_callback:
-                progress_callback(completed_pages, total_pages)
+            chunk_idx, page_indices, parsing_results, error = future.result()
+            page_label = ", ".join(str(p + 1) for p in page_indices)
 
             if error:
                 if error == "Cancelled":
                     cancelled = True
                 else:
-                    errors.append(f"Chunk {chunk_idx + 1} (pages {chunk_start + 1}-{chunk_end + 1}): {error}")
+                    errors.append(
+                        f"Chunk {chunk_idx + 1} (pages {page_label}): {error}"
+                    )
             elif parsing_results:
-                # Map each parsing result to its actual page number
-                for i, pr in enumerate(parsing_results):
-                    actual_page_num = start_page + i
-                    results_dict[actual_page_num] = pr
+                for page_num, page_result in zip(page_indices, parsing_results):
+                    results_dict[page_num] = page_result
 
-    # Handle cancellation
+            if progress_callback:
+                progress_callback(len(results_dict), total_pages)
+
     if cancelled:
         raise CancellationError(
-            f"Processing cancelled after {completed_pages} of {total_pages} pages"
+            f"Processing cancelled after {len(results_dict)} of {total_pages} pages"
         )
 
-    # Report any errors
     if errors:
         error_summary = "; ".join(errors[:5])
         if len(errors) > 5:
             error_summary += f" ... and {len(errors) - 5} more errors"
         raise RuntimeError(f"Some chunks failed to process: {error_summary}")
 
-    # Combine results in page order
-    all_parsing_results = []
-    for page_num in sorted(results_dict.keys()):
-        all_parsing_results.append(results_dict[page_num])
+    missing_after = [i + 1 for i in range(total_pages) if i not in results_dict]
+    if missing_after:
+        raise RuntimeError(
+            f"Missing OCR results for page(s) {missing_after[:10]}"
+            + (" ..." if len(missing_after) > 10 else "")
+        )
 
-    # Combine all results into a single response structure
-    combined_response = {
+    all_parsing_results = [results_dict[p] for p in range(total_pages)]
+    return {
         "errorCode": 0,
         "errorMsg": "Success",
-        "result": {
-            "layoutParsingResults": all_parsing_results,
-        },
+        "result": {"layoutParsingResults": all_parsing_results},
     }
-
-    return combined_response
 
 
 def extract_markdown_from_response(api_response: dict, base_filename: str = "document") -> tuple[str, dict]:
@@ -934,20 +1124,41 @@ def main():
                     if is_pdf:
                         # Use batch processing for PDFs to handle all pages
                         page_count = get_pdf_page_count(file_content)
+                        cached_pages = load_completed_pages(file_hash, options_fp)
+                        already_done = sum(
+                            1 for p in cached_pages if 0 <= p < page_count
+                        )
+
+                        if already_done and already_done < page_count:
+                            st.info(
+                                f"♻️ Resuming: {already_done}/{page_count} pages already "
+                                "cached. Only remaining pages will be sent to the API."
+                            )
+                        elif already_done == page_count and page_count > 0:
+                            st.info(
+                                f"♻️ Assembling {page_count} cached pages into the final result."
+                            )
 
                         # Create containers for progress and cancel status
                         progress_container = st.empty()
+                        initial_ratio = (
+                            already_done / page_count if page_count else 0.0
+                        )
                         progress_bar = progress_container.progress(
-                            0,
-                            text=f"Processing page 0/{page_count}... (Cancel with button above)",
+                            min(1.0, max(0.0, initial_ratio)),
+                            text=(
+                                f"Processing page {already_done}/{page_count}... "
+                                "(Cancel with button above)"
+                            ),
                         )
 
                         def update_progress(current, total):
                             # Check cancel state from session
                             if st.session_state.cancel_requested:
                                 cancel_event.set()
+                            ratio = current / total if total else 0
                             progress_bar.progress(
-                                current / total,
+                                min(1.0, max(0.0, ratio)),
                                 text=f"Processing page {current}/{total}...",
                             )
 
@@ -956,6 +1167,8 @@ def main():
                             filename=uploaded_file.name,
                             progress_callback=update_progress,
                             cancel_event=cancel_event,
+                            file_hash=file_hash,
+                            fingerprint=options_fp,
                             **options,
                         )
                         progress_container.empty()
@@ -1007,10 +1220,20 @@ def main():
                     continue
                 except CancellationError as e:
                     st.warning(f"⏹️ {str(e)}")
+                    if is_pdf:
+                        st.info(
+                            "Completed pages were saved to disk. Click Start OCR again "
+                            "with the same file and options to resume."
+                        )
                     st.session_state.is_processing = False
                     st.stop()  # Stop further processing
                 except RuntimeError as e:
                     st.error(f"❌ Processing error: {str(e)}")
+                    if is_pdf and "no pages" not in str(e).lower():
+                        st.info(
+                            "Successfully processed pages were saved. Click Start OCR again "
+                            "with the same file and options to resume."
+                        )
                     continue
                 except Exception as e:
                     st.error(f"❌ Unexpected error: {str(e)}")
