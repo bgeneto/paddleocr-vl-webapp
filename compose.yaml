@@ -33,6 +33,7 @@ services:
       - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
       - STREAMLIT_THEME_BASE=light
       - DATA_DIR=${DATA_DIR:-/app/data}
+      - DATA_CACHE_RETENTION_DAYS=${DATA_CACHE_RETENTION_DAYS:-45}
       - PADDLEOCR_VL_API_URL=http://paddleocr-vl-api:8080/layout-parsing
       - API_TIMEOUT=${API_TIMEOUT:-300}
       - APP_TITLE=${APP_TITLE:-PaddleOCR-VL Document Parser}
@@ -155,6 +156,11 @@ services:
       LLAMA_ARG_UI: "0"
       # Concurrent CUDA streams on a single GPU (llama.cpp; 0=off)
       GGML_CUDA_GRAPH_OPT: ${GGML_CUDA_GRAPH_OPT:-0}
+    # --sleep-idle-seconds has no LLAMA_ARG_* mapping in llama.cpp; pass as argv.
+    # -1 disables. GET /health does not reset the idle timer or reload the model.
+    command:
+      - --sleep-idle-seconds
+      - "${LLAMA_SLEEP_IDLE_SECONDS:-30}"
     volumes:
       - ./models/llamacpp:/models
       - ./llama-server-entrypoint.sh:/entrypoint.sh:ro

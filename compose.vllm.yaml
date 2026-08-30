@@ -34,6 +34,7 @@ services:
       - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
       - STREAMLIT_THEME_BASE=light
       - DATA_DIR=${DATA_DIR:-/app/data}
+      - DATA_CACHE_RETENTION_DAYS=${DATA_CACHE_RETENTION_DAYS:-45}
       # API Configuration
       - PADDLEOCR_VL_API_URL=http://paddleocr-vl-api:8080/layout-parsing
       - API_TIMEOUT=${API_TIMEOUT:-300}

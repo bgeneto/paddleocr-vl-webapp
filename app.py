@@ -12,11 +12,12 @@ import json
 import logging
 import os
 import re
+import shutil
 import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import fitz  # PyMuPDF for PDF preview
@@ -79,11 +80,21 @@ SUPPORTED_EXTENSIONS = [".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp
 # from disk (no API call). In-progress PDF jobs also checkpoint each completed
 # page under pages/{n:04d}.json so a later Start OCR can skip already-OCR'd
 # pages. The directory survives container recreation via the ./data bind mount
-# (see compose.yaml).
+# (see compose.yaml). Entries older than DATA_CACHE_RETENTION_DAYS are removed
+# automatically (see schedule_cache_cleanup); this cache is not durable storage.
 DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).resolve().parent / "data")))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+# 0 disables automatic eviction. Positive values are a maximum age in days.
+DATA_CACHE_RETENTION_DAYS = int(os.getenv("DATA_CACHE_RETENTION_DAYS", "45"))
 
 logger = logging.getLogger(__name__)
+
+_SHA256_DIR_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
+_cleanup_lock = threading.Lock()
+_last_cache_cleanup_mono: float = 0.0
+_cleanup_thread: threading.Thread | None = None
+# Retention is measured in days; do not walk DATA_DIR on every Streamlit rerun.
+_CACHE_CLEANUP_MIN_INTERVAL_SEC = 60 * 60
 
 # (option key, short name) pairs in fixed order; defines the fingerprint format
 _OPTION_FINGERPRINT_KEYS = (
@@ -134,6 +145,178 @@ def cache_dirs(hash_str: str, fingerprint: str) -> Path:
     entry_dir = DATA_DIR / hash_str / fingerprint
     entry_dir.mkdir(parents=True, exist_ok=True)
     return entry_dir
+
+
+def _parse_iso_datetime(value: object) -> datetime | None:
+    """Parse a meta.json ISO timestamp into an aware UTC datetime."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _cache_entry_timestamp(entry_dir: Path) -> datetime | None:
+    """Best-effort last-write time for a fingerprint cache directory.
+
+    Prefers meta.json updated_at/created_at, then directory mtimes (the
+    fingerprint folder and pages/ checkpoints). Returns None if nothing
+    can be stat'd so the caller will not delete the entry.
+    """
+    candidates: list[datetime] = []
+    meta_path = entry_dir / "meta.json"
+    if meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            meta = None
+        if isinstance(meta, dict):
+            for key in ("updated_at", "created_at"):
+                parsed = _parse_iso_datetime(meta.get(key))
+                if parsed is not None:
+                    candidates.append(parsed)
+    for path in (entry_dir, entry_dir / "pages"):
+        try:
+            if path.exists() and not path.is_symlink():
+                candidates.append(
+                    datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+                )
+        except OSError:
+            pass
+    if not candidates:
+        return None
+    return max(candidates)
+
+
+def _is_sha256_cache_dir(path: Path) -> bool:
+    return (
+        path.is_dir()
+        and not path.is_symlink()
+        and _SHA256_DIR_RE.fullmatch(path.name) is not None
+    )
+
+
+def cleanup_old_cache_dirs() -> int:
+    """Delete DATA_DIR fingerprint folders older than DATA_CACHE_RETENTION_DAYS.
+
+    Must not be called on the Streamlit script thread: listing and rmtree can
+    take noticeable time. Use schedule_cache_cleanup() from main() instead.
+    Does not touch Streamlit session state. Empty SHA-256 parent dirs are
+    removed after their fingerprints. Never raises.
+
+    Returns the number of fingerprint directories removed.
+    """
+    if DATA_CACHE_RETENTION_DAYS < 1:
+        return 0
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=DATA_CACHE_RETENTION_DAYS)
+    try:
+        data_root = DATA_DIR.resolve()
+        children = list(DATA_DIR.iterdir())
+    except OSError as e:
+        logger.warning("Cache cleanup could not list %s: %s", DATA_DIR, e)
+        return 0
+
+    removed = 0
+    try:
+        for hash_dir in children:
+            if not _is_sha256_cache_dir(hash_dir):
+                continue
+            try:
+                if not hash_dir.resolve().is_relative_to(data_root):
+                    continue
+            except OSError:
+                continue
+            try:
+                fingerprints = list(hash_dir.iterdir())
+            except OSError as e:
+                logger.warning("Cache cleanup could not list %s: %s", hash_dir, e)
+                continue
+            for entry_dir in fingerprints:
+                if not entry_dir.is_dir() or entry_dir.is_symlink():
+                    continue
+                try:
+                    if not entry_dir.resolve().is_relative_to(data_root):
+                        continue
+                except OSError:
+                    continue
+                stamp = _cache_entry_timestamp(entry_dir)
+                if stamp is None or stamp > cutoff:
+                    continue
+                try:
+                    shutil.rmtree(entry_dir)
+                    removed += 1
+                    logger.info(
+                        "Removed expired cache entry %s (older than %s days)",
+                        entry_dir,
+                        DATA_CACHE_RETENTION_DAYS,
+                    )
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    logger.warning(
+                        "Failed to remove expired cache entry %s: %s", entry_dir, e
+                    )
+            try:
+                remaining = any(hash_dir.iterdir())
+            except OSError:
+                remaining = True
+            if not remaining:
+                try:
+                    hash_dir.rmdir()
+                except OSError:
+                    pass
+    except Exception as e:
+        logger.warning("Cache cleanup failed: %s", e)
+        return removed
+
+    if removed:
+        logger.info("Cache cleanup removed %s expired folder(s)", removed)
+    return removed
+
+
+def _cache_cleanup_worker() -> None:
+    """Background target: run disk cleanup and swallow unexpected errors."""
+    try:
+        cleanup_old_cache_dirs()
+    except Exception as e:
+        logger.warning("Cache cleanup worker failed: %s", e)
+
+
+def schedule_cache_cleanup() -> None:
+    """Start cache eviction on a daemon thread; return without waiting.
+
+    Safe to call from every Streamlit rerun. At most one worker runs at a
+    time, and a new one is not started more than once per
+    _CACHE_CLEANUP_MIN_INTERVAL_SEC.
+    """
+    global _last_cache_cleanup_mono, _cleanup_thread
+
+    if DATA_CACHE_RETENTION_DAYS < 1:
+        return
+
+    with _cleanup_lock:
+        now_mono = time.monotonic()
+        if (
+            _last_cache_cleanup_mono > 0
+            and now_mono - _last_cache_cleanup_mono < _CACHE_CLEANUP_MIN_INTERVAL_SEC
+        ):
+            return
+        if _cleanup_thread is not None and _cleanup_thread.is_alive():
+            return
+        # Claim the interval before start() so later reruns do not spawn more
+        # threads while this one is still walking the disk.
+        _last_cache_cleanup_mono = now_mono
+        _cleanup_thread = threading.Thread(
+            target=_cache_cleanup_worker,
+            name="cache-cleanup",
+            daemon=True,
+        )
+        _cleanup_thread.start()
 
 
 def display_stem(display_name: str) -> str:
@@ -1717,6 +1900,8 @@ def main():
 
     st.title(f"📄 {APP_TITLE}")
     st.markdown(APP_DESCRIPTION)
+
+    schedule_cache_cleanup()
 
     # Skip the health probe while a job is running so Cancel/progress reruns
     # are not blocked on a /health round-trip.

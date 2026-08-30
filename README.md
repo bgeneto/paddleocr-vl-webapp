@@ -132,6 +132,7 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 | `MAX_FILE_SIZE_MB` | 99 | Maximum upload file size |
 | `MAX_PDF_PAGES` | 250 | Maximum PDF pages to process |
 | `API_TIMEOUT` | 300 | API request timeout in seconds |
+| `DATA_CACHE_RETENTION_DAYS` | 45 | Auto-delete cached `data/` entries older than this many days (`0` disables) |
 
 ### Processing Options
 | Variable | Default | Description |
@@ -198,7 +199,7 @@ data/
 - **Interrupt / resume**: PDF jobs checkpoint each completed chunk (the pages in one API request) under `pages/`. If OCR is interrupted — vLLM/API crash, timeout, cancel, browser/tab close, or container restart — click **Start OCR** again with the same file and the same options. Already-OCR'd pages are skipped; only the remaining pages are sent to the API. A chunk that was in-flight when the API died is retried as a whole (that request is atomic). Closing the browser does **not** keep the original run going in the background; it only preserves completed pages so the next Start OCR can continue.
 - **Survives restarts**: the cache lives on the host bind mount, so `docker compose down && up -d` does not lose it (including partial `pages/` checkpoints).
 - **Visualizations**: the Visualizations tab is not available for results restored from the disk cache (only markdown + ZIP are persisted). Reprocess the file to view them.
-- **Cleanup**: entries are never evicted automatically. Inspect and clean up manually:
+- **Cleanup**: cache folders older than `DATA_CACHE_RETENTION_DAYS` (default 45) are deleted automatically in a background thread when the Streamlit app runs, so page rendering is not delayed. Age is taken from `meta.json` timestamps when present, otherwise from the folder's last write time. Set the variable to `0` to disable. Manual cleanup still works:
 
 ```bash
 du -sh data/                              # total cache size
