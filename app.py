@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import os
+import re
 import threading
 import time
 import zipfile
@@ -203,7 +204,9 @@ def load_cached_result(hash_str: str, fingerprint: str) -> dict | None:
 
     try:
         meta = json.loads((entry_dir / "meta.json").read_text(encoding="utf-8"))
-        markdown_text = (entry_dir / "result.md").read_text(encoding="utf-8")
+        markdown_text = normalize_markdown_math(
+            (entry_dir / "result.md").read_text(encoding="utf-8")
+        )
         stem = display_stem(meta["display_name"])
         images_prefix = f"{stem}_images/"
 
@@ -827,6 +830,128 @@ def process_pdf_in_batches(
     }
 
 
+# PaddleOCR-VL emits KaTeX that Typora and Streamlit both reject:
+#   - inline `$ x $` (space after opening / before closing `$`)
+#   - display `$$...$$` on one line (Typora only accepts a fenced block)
+#   - a bare currency `$` (must be `\$` or KaTeX treats it as math)
+# Normalize once at extract/load so preview, .md download, and ZIP stay in sync.
+_CODE_SEGMENT = re.compile(r"(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]+`)")
+_MATH_HINT = re.compile(
+    r"\\[a-zA-Z]+|[_^{}]|[=<>≤≥±∞∑∫√≠≈·×÷]|[+\-*/]"
+)
+_MATH_IDENT = re.compile(r"^[A-Za-z]\d{0,3}(\([^()]{0,24}\))?$")
+_MATH_NUMBER = re.compile(r"^[0-9]+(\.[0-9]+)?$")
+
+
+def _looks_like_math(inner: str) -> bool:
+    """True when a `$...$` body is LaTeX / ident / number, not `$ or $` prose."""
+    if _MATH_HINT.search(inner):
+        return True
+    return bool(_MATH_IDENT.fullmatch(inner) or _MATH_NUMBER.fullmatch(inner))
+
+
+def _last_emitted_char(chunks: list[str]) -> str:
+    """Last character already written, or newline if the buffer is empty."""
+    if not chunks:
+        return "\n"
+    tail = chunks[-1]
+    return tail[-1] if tail else "\n"
+
+
+def _normalize_math_in_text(segment: str) -> str:
+    """Rewrite math delimiters and escape leftover `$` as `\\$` (currency)."""
+    n = len(segment)
+    i = 0
+    out: list[str] = []
+
+    while i < n:
+        j = i
+        while j < n and segment[j] not in "$\\":
+            j += 1
+        if j > i:
+            out.append(segment[i:j])
+            i = j
+            if i >= n:
+                break
+
+        # Already-escaped literal dollar — leave as `\$` (do not wrap as math)
+        if segment[i] == "\\":
+            if i + 1 < n and segment[i + 1] == "$":
+                out.append("\\$")
+                i += 2
+                continue
+            out.append("\\")
+            i += 1
+            continue
+
+        # Display math: $$ ... $$ (possibly already a Typora block)
+        if i + 1 < n and segment[i + 1] == "$":
+            close = segment.find("$$", i + 2)
+            if close != -1:
+                inner = segment[i + 2 : close].strip()
+                if inner:
+                    if _last_emitted_char(out) != "\n":
+                        out.append("\n")
+                    out.append(f"$$\n{inner}\n$$")
+                    i = close + 2
+                    if i < n and segment[i] != "\n":
+                        out.append("\n")
+                    continue
+
+        # Inline math `$...$` on one line, otherwise currency
+        close = None
+        k = i + 1
+        while k < n:
+            ch = segment[k]
+            if ch == "\n":
+                break
+            if ch == "\\" and k + 1 < n:
+                k += 2
+                continue
+            if ch == "$":
+                if k + 1 < n and segment[k + 1] == "$":
+                    break
+                close = k
+                break
+            k += 1
+
+        if close is not None:
+            inner = segment[i + 1 : close].strip()
+            if inner and _looks_like_math(inner):
+                out.append(f"${inner}$")
+                i = close + 1
+                continue
+
+        out.append("\\$")
+        i += 1
+
+    return "".join(out)
+
+
+def normalize_markdown_math(text: str) -> str:
+    """Make OCR markdown math compatible with Typora and Streamlit KaTeX.
+
+    Idempotent. Fenced/inline code is left untouched. Display `$$...$$` is
+    rewritten as a block; spaced `$ ... $` becomes `$...$` when the body looks
+    like math. Any remaining `$` is currency and is escaped as `\\$`.
+    """
+    if not text or "$" not in text:
+        return text
+
+    pieces = _CODE_SEGMENT.split(text)
+    out: list[str] = []
+    for piece in pieces:
+        if not piece:
+            continue
+        if piece.startswith(("```", "~~~")) or (
+            piece.startswith("`") and piece.endswith("`") and "\n" not in piece
+        ):
+            out.append(piece)
+        else:
+            out.append(_normalize_math_in_text(piece))
+    return "".join(out)
+
+
 def extract_markdown_from_response(api_response: dict, base_filename: str = "document") -> tuple[str, dict]:
     """
     Extract markdown text and images from API response.
@@ -881,7 +1006,7 @@ def extract_markdown_from_response(api_response: dict, base_filename: str = "doc
             markdown_parts.append(markdown_text)
 
     full_markdown = "\n\n---\n\n".join(markdown_parts)
-    return full_markdown, all_images
+    return normalize_markdown_math(full_markdown), all_images
 
 
 def create_download_zip(markdown_text: str, images: dict, base_filename: str) -> bytes:
@@ -1106,7 +1231,8 @@ def main():
                     )
                 else:
                     st.info("📋 Using cached results. Re-upload to reprocess.")
-                markdown_text = cached["markdown"]
+                markdown_text = normalize_markdown_math(cached["markdown"])
+                cached["markdown"] = markdown_text
                 images = cached["images"]
             elif (disk_hit := load_cached_result(file_hash, options_fp)) is not None:
                 # Stored on disk from an earlier run - serve instantly, no API call
