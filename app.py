@@ -413,7 +413,9 @@ def apply_quality_infer_fields(payload: dict) -> dict:
             "markdownIgnoreLabels": [],
             "layoutThreshold": 0.2,
             "layoutNms": False,
-            "layoutUnclipRatio": [1.08, 1.12],
+            # Serving schema types this as Tuple, then the validator rejects
+            # tuples. A JSON array therefore 400s. A single number is accepted.
+            "layoutUnclipRatio": 1.1,
             "layoutMergeBboxesMode": "union",
             "layoutShapeMode": "poly",
             "maxPixels": _QUALITY_VLM_MAX_PIXELS,
@@ -1157,17 +1159,7 @@ def display_processing_options() -> dict:
     """Display and collect processing options from sidebar."""
     st.sidebar.header("⚙️ Processing Options")
     if OCR_QUALITY_FIRST:
-        st.sidebar.success(
-            "Quality-first pipeline is on (`OCR_QUALITY_FIRST=true`). "
-            "Seal OCR, figure-text OCR, high-recall layout, and cross-page "
-            "reconstruction are enabled. Recreate the API container after "
-            "changing this variable."
-        )
-    else:
-        st.sidebar.caption(
-            "Speed-first defaults. Set `OCR_QUALITY_FIRST=true` in `.env` "
-            "and recreate the API container for higher recall."
-        )
+        st.sidebar.info("Quality-first pipeline is on.")
 
     # Widget keys include the mode so flipping the env var does not keep
     # stale Streamlit checkbox state from the other mode.

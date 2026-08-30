@@ -132,7 +132,7 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 ### Processing Options
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OCR_QUALITY_FIRST` | false | Master switch. `false` keeps the speed-first pipeline. `true` loads extra detectors, high-recall layout, figure/seal OCR, and cross-page reconstruction. Recreate the API and Streamlit containers after changing it. |
+| `OCR_QUALITY_FIRST` | false | Master switch. `false` keeps the speed-first pipeline. `true` loads extra detectors, high-recall layout, figure/seal OCR, and cross-page reconstruction. On the llama.cpp stack it also switches KV cache from `q4_0` to `q8_0`. Recreate API, Streamlit, and `paddleocr-vlm-server` after changing it. |
 | `USE_DOC_ORIENTATION_CLASSIFY` | false | Auto-detect document orientation (sidebar default; quality-first defaults this on) |
 | `USE_DOC_UNWARPING` | false | Correct curved/distorted documents |
 | `USE_LAYOUT_DETECTION` | true | Enable layout structure detection |
@@ -163,6 +163,8 @@ Speed-first (`false`) is unchanged: same YAML, same request body, same cache key
 | `LLAMA_MAX_PARALLEL_PAGES` | 4 | Streamlit concurrent API workers for the llama.cpp stack |
 | `LLAMA_PAGES_PER_CHUNK` | 8 | Pages per API request on the llama.cpp stack |
 | `LLAMA_N_PARALLEL` | 8 | llama-server slots and paddlex VLM `max_concurrency` |
+| `LLAMA_UBATCH_SIZE` | 2048 | llama-server `--ubatch-size` (vision prefill). llama.cpp default is 512 |
+| `LLAMA_N_GPU_LAYERS` | 99 | Offload all decoder layers to GPU |
 
 ## Persistence & Caching
 

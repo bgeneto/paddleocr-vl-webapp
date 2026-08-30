@@ -58,4 +58,15 @@ CTX_SLOT=$((TOTAL / N_PARALLEL))
 echo "llama.cpp context: n_ctx=${TOTAL} (${N_PARALLEL} slots, n_ctx_slot=${CTX_SLOT})"
 export LLAMA_ARG_CTX_SIZE="$TOTAL"
 
+# Speed-first: q4_0 KV (faster, less VRAM). Quality-first: q8_0 KV.
+# Quantized V cache needs flash-attn (LLAMA_ARG_FLASH_ATTN=on in compose).
+if [ "${OCR_QUALITY_FIRST:-false}" = "true" ]; then
+    export LLAMA_ARG_CACHE_TYPE_K=q8_0
+    export LLAMA_ARG_CACHE_TYPE_V=q8_0
+else
+    export LLAMA_ARG_CACHE_TYPE_K=q4_0
+    export LLAMA_ARG_CACHE_TYPE_V=q4_0
+fi
+echo "llama.cpp KV cache: ${LLAMA_ARG_CACHE_TYPE_K}/${LLAMA_ARG_CACHE_TYPE_V} (OCR_QUALITY_FIRST=${OCR_QUALITY_FIRST:-false})"
+
 exec /app/llama-server "$@"

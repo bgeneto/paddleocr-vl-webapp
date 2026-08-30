@@ -140,6 +140,12 @@ services:
       LLAMA_CTX_MAX: ${LLAMA_CTX_MAX:-131072}
       LLAMA_ARG_N_PARALLEL: ${LLAMA_N_PARALLEL:-8}
       LLAMA_ARG_FLASH_ATTN: on
+      # Entrypoint sets KV cache to q4_0 (speed) or q8_0 (OCR_QUALITY_FIRST=true)
+      OCR_QUALITY_FIRST: ${OCR_QUALITY_FIRST:-false}
+      # Default ubatch is 512; 2048 packs vision prefill in fewer GPU steps
+      LLAMA_ARG_UBATCH: ${LLAMA_UBATCH_SIZE:-2048}
+      # Headless OCR sidecar — no llama.cpp Web UI
+      LLAMA_ARG_UI: "0"
     volumes:
       - ./models/llamacpp:/models
       - ./llama-server-entrypoint.sh:/entrypoint.sh:ro
