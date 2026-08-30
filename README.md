@@ -142,6 +142,7 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 | `USE_LAYOUT_DETECTION` | true | Enable layout structure detection |
 | `USE_CHART_RECOGNITION` | false | Enable chart/diagram recognition. Stays **off** in quality-first (enable from the sidebar when needed). |
 | `PRETTIFY_MARKDOWN` | true | Format markdown for readability |
+| `INCLUDE_PAGE_MARKERS` | true | Insert `<!-- Page N -->` comments between pages for RAG chunking (sidebar **Page comments**). Quality-first concatenation is skipped while this is on so page boundaries stay in the markdown. |
 | `VISUALIZE_RESULTS` | false | Return processing visualizations |
 
 Set `OCR_QUALITY_FIRST=true` in `.env`, then recreate so the API loads the quality YAML (models are chosen at container start, not per request):
@@ -169,8 +170,8 @@ Speed-first (`false`) is unchanged: same YAML, same request body, same cache key
 | `LLAMA_MMPROJ_URL` | PaddlePaddle official mmproj | Direct download URL for the vision projector |
 | `LLAMA_CTX_SIZE` | 8192 | Desired tokens **per llama-server slot**; total `n_ctx` is `min(CTX_SIZE × N_PARALLEL, CTX_MAX)` |
 | `LLAMA_CTX_MAX` | 131072 | Cap on total llama-server `--ctx-size` |
-| `LLAMA_MAX_PARALLEL_PAGES` | 4 | Streamlit concurrent API workers for the llama.cpp stack |
-| `LLAMA_PAGES_PER_CHUNK` | 8 | Pages per API request on the llama.cpp stack |
+| `LLAMA_MAX_PARALLEL_PAGES` | 2 | Streamlit concurrent API workers for the llama.cpp stack |
+| `LLAMA_PAGES_PER_CHUNK` | 22 | Pages per API request on the llama.cpp stack |
 | `LLAMA_N_PARALLEL` | 8 | llama-server slots and paddlex VLM `max_concurrency` |
 | `LLAMA_UBATCH_SIZE` | 2048 | llama-server `--ubatch-size` (vision prefill). llama.cpp default is 512 |
 | `LLAMA_N_GPU_LAYERS` | 99 | Offload all decoder layers to GPU |
@@ -182,7 +183,7 @@ Processed results are persisted to a `data/` directory on the host (bind-mounted
 ```
 data/
 └── <sha256-of-file-content>/
-    └── <options-fingerprint>/     # e.g. orient=0_unwarp=0_layout=1_chart=0_pretty=1_vis=0
+    └── <options-fingerprint>/     # e.g. orient=0_unwarp=0_layout=1_chart=0_pretty=1_vis=0_pages=1
                                    # quality-first adds _q=1 so it never reuses a speed cache entry
         ├── meta.json              # display name, hash, options, page count, status, timestamps, sizes
         ├── pages/                 # incremental PDF checkpoints (one JSON file per completed page)

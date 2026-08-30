@@ -58,6 +58,9 @@ USE_LAYOUT_DETECTION = os.getenv("USE_LAYOUT_DETECTION", "true").lower() == "tru
 USE_CHART_RECOGNITION = os.getenv("USE_CHART_RECOGNITION", "false").lower() == "true"
 PRETTIFY_MARKDOWN = os.getenv("PRETTIFY_MARKDOWN", "true").lower() == "true"
 VISUALIZE_RESULTS = os.getenv("VISUALIZE_RESULTS", "false").lower() == "true"
+# HTML comments like <!-- Page 2 --> between pages (RAG chunking). On by
+# default. When on, quality-first does not concatenate pages into one blob.
+INCLUDE_PAGE_MARKERS = os.getenv("INCLUDE_PAGE_MARKERS", "true").lower() == "true"
 # Speed-first remains the default. true selects the quality YAML (compose),
 # high-recall infer fields, and post-chunk /restructure-pages.
 OCR_QUALITY_FIRST = os.getenv("OCR_QUALITY_FIRST", "false").lower() == "true"
@@ -70,7 +73,7 @@ SUPPORTED_EXTENSIONS = [".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp
 # Persistence / result cache
 # =============================================================================
 # Successful results are stored under DATA_DIR, keyed by the SHA-256 of the
-# file content and a fingerprint of the six processing options:
+# file content and a fingerprint of the processing options:
 #   DATA_DIR/<sha256>/<options-fingerprint>/{meta.json,result.md,result.zip,pages/}
 # Re-uploading a byte-identical file with the same options is served instantly
 # from disk (no API call). In-progress PDF jobs also checkpoint each completed
@@ -90,7 +93,17 @@ _OPTION_FINGERPRINT_KEYS = (
     ("use_chart_recognition", "chart"),
     ("prettify_markdown", "pretty"),
     ("visualize", "vis"),
+    ("include_page_markers", "pages"),
 )
+# Keys accepted by process_document / the layout-parsing request body.
+_LAYOUT_API_OPTION_KEYS = tuple(
+    key for key, _ in _OPTION_FINGERPRINT_KEYS if key != "include_page_markers"
+)
+
+
+def _layout_api_options(options: dict) -> dict:
+    """Sidebar keys that belong in the layout-parsing request body."""
+    return {key: options[key] for key in _LAYOUT_API_OPTION_KEYS if key in options}
 
 
 def compute_sha256(content: bytes) -> str:
@@ -99,10 +112,11 @@ def compute_sha256(content: bytes) -> str:
 
 
 def options_fingerprint(options: dict) -> str:
-    """Deterministic compact fingerprint of the six processing options.
+    """Deterministic compact fingerprint of the processing options.
 
-    Example: 'orient=1_unwarp=0_layout=1_chart=0_pretty=1_vis=0'. Key order is
-    fixed here, so the ordering of the caller's dict does not matter.
+    Example: 'orient=1_unwarp=0_layout=1_chart=0_pretty=1_vis=0_pages=1'.
+    Key order is fixed here, so the ordering of the caller's dict does not
+    matter.
     Quality-first runs append '_q=1' so they never reuse a speed-first cache
     entry; speed-first fingerprints are unchanged.
     """
@@ -503,13 +517,19 @@ def apply_quality_infer_fields(payload: dict) -> dict:
 
 
 def restructure_parsing_results(
-    parsing_results: list, prettify_markdown: bool = True
+    parsing_results: list,
+    prettify_markdown: bool = True,
+    concatenate_pages: bool = True,
 ) -> list:
-    """Merge tables / relevel titles / concatenate pages after chunked OCR.
+    """Merge tables / relevel titles / optionally concatenate pages after OCR.
 
     No-ops (returns the input list) unless OCR_QUALITY_FIRST is on and there
     are at least two pages with prunedResult. Failures are logged and the
     original per-page results are kept.
+
+    concatenate_pages must be False when HTML page comments are wanted:
+    extract_markdown_from_response only emits <!-- Page N --> when more than
+    one layoutParsingResults item remains.
     """
     if not OCR_QUALITY_FIRST or len(parsing_results) < 2:
         return parsing_results
@@ -536,7 +556,7 @@ def restructure_parsing_results(
                 "pages": pages,
                 "mergeTables": True,
                 "relevelTitles": True,
-                "concatenatePages": True,
+                "concatenatePages": concatenate_pages,
                 "prettifyMarkdown": prettify_markdown,
             },
             timeout=API_TIMEOUT,
@@ -830,7 +850,7 @@ def process_chunk(args: tuple) -> tuple[int, list[int], list | None, str | None]
         chunk_response = process_document(
             file_content=chunk_content,
             filename=filename,
-            **options,
+            **_layout_api_options(options),
         )
         result = chunk_response.get("result", {})
         parsing_results = result.get("layoutParsingResults", [])
@@ -920,7 +940,11 @@ def process_pdf_in_batches(
         progress_callback(len(results_dict), total_pages)
 
     if not missing_pages:
-        all_parsing_results = [results_dict[p] for p in range(total_pages)]
+        all_parsing_results = restructure_parsing_results(
+            [results_dict[p] for p in range(total_pages)],
+            prettify_markdown=bool(options.get("prettify_markdown", True)),
+            concatenate_pages=not bool(options.get("include_page_markers", True)),
+        )
         return {
             "errorCode": 0,
             "errorMsg": "Success",
@@ -1011,6 +1035,7 @@ def process_pdf_in_batches(
     all_parsing_results = restructure_parsing_results(
         all_parsing_results,
         prettify_markdown=bool(options.get("prettify_markdown", True)),
+        concatenate_pages=not bool(options.get("include_page_markers", True)),
     )
     return {
         "errorCode": 0,
@@ -1141,7 +1166,11 @@ def normalize_markdown_math(text: str) -> str:
     return "".join(out)
 
 
-def extract_markdown_from_response(api_response: dict, base_filename: str = "document") -> tuple[str, dict]:
+def extract_markdown_from_response(
+    api_response: dict,
+    base_filename: str = "document",
+    include_page_markers: bool = True,
+) -> tuple[str, dict]:
     """
     Extract markdown text and images from API response.
 
@@ -1150,9 +1179,13 @@ def extract_markdown_from_response(api_response: dict, base_filename: str = "doc
     - Rewritten: {base_filename}_images/page_{n}/img_xxx.jpg (multi-page)
     - Rewritten: {base_filename}_images/img_xxx.jpg (single-page)
 
+    When include_page_markers is True and there is more than one page, each
+    page is prefixed with an HTML comment (`<!-- Page N -->`) for RAG splits.
+
     Args:
         api_response: The API response dictionary
         base_filename: Base filename for constructing image paths (without extension)
+        include_page_markers: Insert <!-- Page N --> comments between pages
 
     Returns:
         Tuple of (markdown_text, images_dict)
@@ -1189,7 +1222,7 @@ def extract_markdown_from_response(api_response: dict, base_filename: str = "doc
             # Replace original path with new path in markdown
             markdown_text = markdown_text.replace(original_path, new_path)
 
-        if len(parsing_results) > 1:
+        if include_page_markers and len(parsing_results) > 1:
             markdown_parts.append(f"<!-- Page {i + 1} -->\n\n{markdown_text}")
         else:
             markdown_parts.append(markdown_text)
@@ -1414,13 +1447,15 @@ def _process_one_file_for_job(
         api_response = process_document(
             file_content=file_content,
             filename=filename,
-            **options,
+            **_layout_api_options(options),
         )
         job.set_progress(1, 1)
 
     base_filename = display_stem(filename)
     markdown_text, images = extract_markdown_from_response(
-        api_response, base_filename
+        api_response,
+        base_filename,
+        include_page_markers=bool(options.get("include_page_markers", True)),
     )
     processing_time = time.time() - start_time
     job.add_message(
@@ -1616,8 +1651,6 @@ def display_ocr_file_output(
 def display_processing_options() -> dict:
     """Display and collect processing options from sidebar."""
     st.sidebar.header("⚙️ Processing Options")
-    if OCR_QUALITY_FIRST:
-        st.sidebar.info("Quality-first pipeline is on.")
 
     # Widget keys include the mode so flipping the env var does not keep
     # stale Streamlit checkbox state from the other mode.
@@ -1653,12 +1686,23 @@ def display_processing_options() -> dict:
             value=PRETTIFY_MARKDOWN,
             help="Format markdown output for better readability",
         ),
+        "include_page_markers": st.sidebar.checkbox(
+            "Page comments",
+            value=INCLUDE_PAGE_MARKERS,
+            key=f"opt_pages_{mode_key}",
+            help="Insert HTML comments such as <!-- Page 2 --> between pages. "
+            "Needed for RAG chunking. In quality-first mode this also keeps "
+            "pages separate instead of concatenating them into one document.",
+        ),
         "visualize": st.sidebar.checkbox(
             "Show Visualization",
             value=VISUALIZE_RESULTS,
             help="Display intermediate processing results (slower)",
         ),
     }
+
+    if OCR_QUALITY_FIRST:
+        st.sidebar.info("Quality-first pipeline is on.")
 
     return options
 

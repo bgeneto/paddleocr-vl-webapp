@@ -40,14 +40,15 @@ services:
       - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-99}
       - MAX_PDF_PAGES=${MAX_PDF_PAGES:-250}
       # llama.cpp-only throughput (do not reuse vLLM MAX_PARALLEL_PAGES / PAGES_PER_CHUNK)
-      - MAX_PARALLEL_PAGES=${LLAMA_MAX_PARALLEL_PAGES:-4}
+      - MAX_PARALLEL_PAGES=${LLAMA_MAX_PARALLEL_PAGES:-2}
       - MAX_PREVIEW_PAGES=${MAX_PREVIEW_PAGES:-10}
-      - PAGES_PER_CHUNK=${LLAMA_PAGES_PER_CHUNK:-8}
+      - PAGES_PER_CHUNK=${LLAMA_PAGES_PER_CHUNK:-22}
       - USE_DOC_ORIENTATION_CLASSIFY=${USE_DOC_ORIENTATION_CLASSIFY:-false}
       - USE_DOC_UNWARPING=${USE_DOC_UNWARPING:-false}
       - USE_LAYOUT_DETECTION=${USE_LAYOUT_DETECTION:-true}
       - USE_CHART_RECOGNITION=${USE_CHART_RECOGNITION:-false}
       - PRETTIFY_MARKDOWN=${PRETTIFY_MARKDOWN:-true}
+      - INCLUDE_PAGE_MARKERS=${INCLUDE_PAGE_MARKERS:-true}
       - VISUALIZE_RESULTS=${VISUALIZE_RESULTS:-false}
       - OCR_QUALITY_FIRST=${OCR_QUALITY_FIRST:-false}
     volumes:
@@ -149,8 +150,11 @@ services:
       OCR_QUALITY_FIRST: ${OCR_QUALITY_FIRST:-false}
       # Default ubatch is 512; 2048 packs vision prefill in fewer GPU steps
       LLAMA_ARG_UBATCH: ${LLAMA_UBATCH_SIZE:-2048}
+      LLAMA_ARG_BATCH: ${LLAMA_BATCH_SIZE:-2048}
       # Headless OCR sidecar — no llama.cpp Web UI
       LLAMA_ARG_UI: "0"
+      # Concurrent CUDA streams on a single GPU (llama.cpp; 0=off)
+      GGML_CUDA_GRAPH_OPT: ${GGML_CUDA_GRAPH_OPT:-0}
     volumes:
       - ./models/llamacpp:/models
       - ./llama-server-entrypoint.sh:/entrypoint.sh:ro
