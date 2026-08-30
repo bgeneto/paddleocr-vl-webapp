@@ -140,7 +140,7 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 | `USE_DOC_ORIENTATION_CLASSIFY` | false | Auto-detect document orientation (sidebar default; quality-first defaults this on) |
 | `USE_DOC_UNWARPING` | false | Correct curved/distorted documents. Stays **off** in quality-first (UVDoc unwarping 500s the llama.cpp VLM). |
 | `USE_LAYOUT_DETECTION` | true | Enable layout structure detection |
-| `USE_CHART_RECOGNITION` | false | Enable chart/diagram recognition |
+| `USE_CHART_RECOGNITION` | false | Enable chart/diagram recognition. Stays **off** in quality-first (enable from the sidebar when needed). |
 | `PRETTIFY_MARKDOWN` | true | Format markdown for readability |
 | `VISUALIZE_RESULTS` | false | Return processing visualizations |
 

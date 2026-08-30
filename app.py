@@ -1644,9 +1644,9 @@ def display_processing_options() -> dict:
         ),
         "use_chart_recognition": st.sidebar.checkbox(
             "Chart Recognition",
-            value=True if OCR_QUALITY_FIRST else USE_CHART_RECOGNITION,
-            key=f"opt_chart_{mode_key}",
-            help="Enable chart and diagram recognition",
+            value=USE_CHART_RECOGNITION,
+            key=f"opt_chart_{mode_key}_off",
+            help="Enable chart and diagram recognition. Off by default in quality-first too.",
         ),
         "prettify_markdown": st.sidebar.checkbox(
             "Prettify Markdown",
