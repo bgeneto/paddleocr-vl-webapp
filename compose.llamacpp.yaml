@@ -49,6 +49,7 @@ services:
       - USE_CHART_RECOGNITION=${USE_CHART_RECOGNITION:-false}
       - PRETTIFY_MARKDOWN=${PRETTIFY_MARKDOWN:-true}
       - VISUALIZE_RESULTS=${VISUALIZE_RESULTS:-false}
+      - OCR_QUALITY_FIRST=${OCR_QUALITY_FIRST:-false}
     volumes:
       - ./app.py:/app/app.py:ro
       - ./logs:/app/logs
@@ -81,14 +82,21 @@ services:
     restart: unless-stopped
     environment:
       - LLAMA_N_PARALLEL=${LLAMA_N_PARALLEL:-8}
+      - OCR_QUALITY_FIRST=${OCR_QUALITY_FIRST:-false}
     volumes:
-      - ./pipeline_config_llamacpp.yaml:/home/paddleocr/pipeline_config.yaml:ro
+      - ./pipeline_config_llamacpp.yaml:/home/paddleocr/pipeline_config_speed.yaml:ro
+      - ./pipeline_config_llamacpp_quality.yaml:/home/paddleocr/pipeline_config_quality.yaml:ro
     command:
       - /bin/bash
       - -c
       - |
+        CFG=/home/paddleocr/pipeline_config_speed.yaml
+        if [ "$${OCR_QUALITY_FIRST:-false}" = "true" ]; then
+          echo "[startup] OCR_QUALITY_FIRST=true; serving quality pipeline YAML"
+          CFG=/home/paddleocr/pipeline_config_quality.yaml
+        fi
         sed "s/max_concurrency: [0-9][0-9]*/max_concurrency: $${LLAMA_N_PARALLEL}/" \
-          /home/paddleocr/pipeline_config.yaml > /tmp/pipeline_config.yaml
+          "$$CFG" > /tmp/pipeline_config.yaml
         paddlex --serve --pipeline /tmp/pipeline_config.yaml
     depends_on:
       paddleocr-vlm-server:

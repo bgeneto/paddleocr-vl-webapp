@@ -132,12 +132,22 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 ### Processing Options
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `USE_DOC_ORIENTATION_CLASSIFY` | false | Auto-detect document orientation |
+| `OCR_QUALITY_FIRST` | false | Master switch. `false` keeps the speed-first pipeline. `true` loads extra detectors, high-recall layout, figure/seal OCR, and cross-page reconstruction. Recreate the API and Streamlit containers after changing it. |
+| `USE_DOC_ORIENTATION_CLASSIFY` | false | Auto-detect document orientation (sidebar default; quality-first defaults this on) |
 | `USE_DOC_UNWARPING` | false | Correct curved/distorted documents |
 | `USE_LAYOUT_DETECTION` | true | Enable layout structure detection |
 | `USE_CHART_RECOGNITION` | false | Enable chart/diagram recognition |
 | `PRETTIFY_MARKDOWN` | true | Format markdown for readability |
 | `VISUALIZE_RESULTS` | false | Return processing visualizations |
+
+Set `OCR_QUALITY_FIRST=true` in `.env`, then recreate so the API loads the quality YAML (models are chosen at container start, not per request):
+
+```bash
+docker compose up -d --force-recreate
+# or: docker compose -f compose.llamacpp.yaml up -d --force-recreate
+```
+
+Speed-first (`false`) is unchanged: same YAML, same request body, same cache keys.
 
 ### Docker/Infrastructure
 | Variable | Default | Description |
@@ -162,6 +172,7 @@ Processed results are persisted to a `data/` directory on the host (bind-mounted
 data/
 └── <sha256-of-file-content>/
     └── <options-fingerprint>/     # e.g. orient=0_unwarp=0_layout=1_chart=0_pretty=1_vis=0
+                                   # quality-first adds _q=1 so it never reuses a speed cache entry
         ├── meta.json              # display name, hash, options, page count, status, timestamps, sizes
         ├── pages/                 # incremental PDF checkpoints (one JSON file per completed page)
         │   ├── 0000.json

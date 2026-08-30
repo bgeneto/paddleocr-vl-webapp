@@ -1,3 +1,0 @@
-# Placeholder so the data/ directory is committed with the invoking user's
-# ownership. Processed results (markdown + ZIP) are cached here, keyed by
-# file SHA-256 and processing options. Contents are gitignored.

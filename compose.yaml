@@ -48,6 +48,7 @@ services:
       - USE_CHART_RECOGNITION=${USE_CHART_RECOGNITION:-false}
       - PRETTIFY_MARKDOWN=${PRETTIFY_MARKDOWN:-true}
       - VISUALIZE_RESULTS=${VISUALIZE_RESULTS:-false}
+      - OCR_QUALITY_FIRST=${OCR_QUALITY_FIRST:-false}
     volumes:
       - ./app.py:/app/app.py:ro
       - ./logs:/app/logs
@@ -81,7 +82,19 @@ services:
     restart: unless-stopped
     environment:
       - VLM_BACKEND=${VLM_BACKEND:-vllm}
-    command: /bin/bash -c "paddlex --serve --pipeline /home/paddleocr/pipeline_config_${VLM_BACKEND:-vllm}.yaml"
+      - OCR_QUALITY_FIRST=${OCR_QUALITY_FIRST:-false}
+    volumes:
+      - ./pipeline_config_vllm_quality.yaml:/home/paddleocr/pipeline_config_quality.yaml:ro
+    command:
+      - /bin/bash
+      - -c
+      - |
+        if [ "$${OCR_QUALITY_FIRST:-false}" = "true" ]; then
+          echo "[startup] OCR_QUALITY_FIRST=true; serving quality pipeline YAML"
+          paddlex --serve --pipeline /home/paddleocr/pipeline_config_quality.yaml
+        else
+          paddlex --serve --pipeline /home/paddleocr/pipeline_config_$${VLM_BACKEND:-vllm}.yaml
+        fi
     depends_on:
       paddleocr-vlm-server:
         condition: service_healthy

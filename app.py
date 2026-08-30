@@ -58,6 +58,10 @@ USE_LAYOUT_DETECTION = os.getenv("USE_LAYOUT_DETECTION", "true").lower() == "tru
 USE_CHART_RECOGNITION = os.getenv("USE_CHART_RECOGNITION", "false").lower() == "true"
 PRETTIFY_MARKDOWN = os.getenv("PRETTIFY_MARKDOWN", "true").lower() == "true"
 VISUALIZE_RESULTS = os.getenv("VISUALIZE_RESULTS", "false").lower() == "true"
+# Speed-first remains the default. true selects the quality YAML (compose),
+# high-recall infer fields, and post-chunk /restructure-pages.
+OCR_QUALITY_FIRST = os.getenv("OCR_QUALITY_FIRST", "false").lower() == "true"
+_QUALITY_VLM_MAX_PIXELS = 1_605_632
 
 # Supported file types
 SUPPORTED_EXTENSIONS = [".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp"]
@@ -99,11 +103,16 @@ def options_fingerprint(options: dict) -> str:
 
     Example: 'orient=1_unwarp=0_layout=1_chart=0_pretty=1_vis=0'. Key order is
     fixed here, so the ordering of the caller's dict does not matter.
+    Quality-first runs append '_q=1' so they never reuse a speed-first cache
+    entry; speed-first fingerprints are unchanged.
     """
-    return "_".join(
+    fingerprint = "_".join(
         f"{short}={'1' if options.get(key) else '0'}"
         for key, short in _OPTION_FINGERPRINT_KEYS
     )
+    if OCR_QUALITY_FIRST:
+        return f"{fingerprint}_q=1"
+    return fingerprint
 
 
 def cache_dirs(hash_str: str, fingerprint: str) -> Path:
@@ -389,6 +398,108 @@ def encode_file_to_base64(file_content: bytes) -> str:
     return base64.b64encode(file_content).decode("ascii")
 
 
+def apply_quality_infer_fields(payload: dict) -> dict:
+    """Add modal-paddleocr infer fields when OCR_QUALITY_FIRST is on.
+
+    Sidebar flags (orientation, unwarping, layout, chart) stay in *payload*
+    as the caller set them. This only adds fields the speed UI does not expose.
+    """
+    if not OCR_QUALITY_FIRST:
+        return payload
+    payload.update(
+        {
+            "useSealRecognition": True,
+            "useOcrForImageBlock": True,
+            "markdownIgnoreLabels": [],
+            "layoutThreshold": 0.2,
+            "layoutNms": False,
+            "layoutUnclipRatio": [1.08, 1.12],
+            "layoutMergeBboxesMode": "union",
+            "layoutShapeMode": "poly",
+            "maxPixels": _QUALITY_VLM_MAX_PIXELS,
+            "vlmExtraArgs": {
+                "ocr_max_pixels": _QUALITY_VLM_MAX_PIXELS,
+                "table_max_pixels": _QUALITY_VLM_MAX_PIXELS,
+                "formula_max_pixels": _QUALITY_VLM_MAX_PIXELS,
+                "chart_max_pixels": _QUALITY_VLM_MAX_PIXELS,
+                "seal_max_pixels": _QUALITY_VLM_MAX_PIXELS,
+            },
+        }
+    )
+    return payload
+
+
+def restructure_parsing_results(
+    parsing_results: list, prettify_markdown: bool = True
+) -> list:
+    """Merge tables / relevel titles / concatenate pages after chunked OCR.
+
+    No-ops (returns the input list) unless OCR_QUALITY_FIRST is on and there
+    are at least two pages with prunedResult. Failures are logged and the
+    original per-page results are kept.
+    """
+    if not OCR_QUALITY_FIRST or len(parsing_results) < 2:
+        return parsing_results
+
+    pages = []
+    for page in parsing_results:
+        pruned = page.get("prunedResult")
+        if not isinstance(pruned, dict):
+            logger.warning(
+                "Skipping /restructure-pages: a page is missing prunedResult"
+            )
+            return parsing_results
+        item: dict = {"prunedResult": pruned}
+        images = (page.get("markdown") or {}).get("images")
+        if images:
+            item["markdownImages"] = images
+        pages.append(item)
+
+    url = f"{PADDLEOCR_VL_API_URL.rsplit('/', 1)[0]}/restructure-pages"
+    try:
+        response = get_http_session().post(
+            url,
+            json={
+                "pages": pages,
+                "mergeTables": True,
+                "relevelTitles": True,
+                "concatenatePages": True,
+                "prettifyMarkdown": prettify_markdown,
+            },
+            timeout=API_TIMEOUT,
+            headers={"Content-Type": "application/json"},
+        )
+        if response.status_code != 200:
+            logger.warning(
+                "restructure-pages failed: %s %s",
+                response.status_code,
+                response.text[:500],
+            )
+            return parsing_results
+        data = response.json()
+        if data.get("errorCode") not in (None, 0):
+            logger.warning(
+                "restructure-pages errorCode=%s %s",
+                data.get("errorCode"),
+                data.get("errorMsg"),
+            )
+            return parsing_results
+        result = data.get("result") or data
+        new_results = result.get("layoutParsingResults")
+        if not new_results:
+            logger.warning("restructure-pages returned no layoutParsingResults")
+            return parsing_results
+        logger.info(
+            "Restructured %s pages into %s result(s)",
+            len(parsing_results),
+            len(new_results),
+        )
+        return new_results
+    except Exception as e:
+        logger.warning("restructure-pages error: %s", e)
+        return parsing_results
+
+
 def decode_base64_image(base64_string: str) -> bytes:
     """Decode base64 string to image bytes."""
     return base64.b64decode(base64_string)
@@ -590,6 +701,7 @@ def process_document(
         "prettifyMarkdown": prettify_markdown,
         "visualize": visualize,
     }
+    apply_quality_infer_fields(payload)
 
     # Make API request using pooled session
     session = get_http_session()
@@ -823,6 +935,10 @@ def process_pdf_in_batches(
         )
 
     all_parsing_results = [results_dict[p] for p in range(total_pages)]
+    all_parsing_results = restructure_parsing_results(
+        all_parsing_results,
+        prettify_markdown=bool(options.get("prettify_markdown", True)),
+    )
     return {
         "errorCode": 0,
         "errorMsg": "Success",
@@ -1040,26 +1156,46 @@ def create_download_zip(markdown_text: str, images: dict, base_filename: str) ->
 def display_processing_options() -> dict:
     """Display and collect processing options from sidebar."""
     st.sidebar.header("⚙️ Processing Options")
+    if OCR_QUALITY_FIRST:
+        st.sidebar.success(
+            "Quality-first pipeline is on (`OCR_QUALITY_FIRST=true`). "
+            "Seal OCR, figure-text OCR, high-recall layout, and cross-page "
+            "reconstruction are enabled. Recreate the API container after "
+            "changing this variable."
+        )
+    else:
+        st.sidebar.caption(
+            "Speed-first defaults. Set `OCR_QUALITY_FIRST=true` in `.env` "
+            "and recreate the API container for higher recall."
+        )
+
+    # Widget keys include the mode so flipping the env var does not keep
+    # stale Streamlit checkbox state from the other mode.
+    mode_key = "q" if OCR_QUALITY_FIRST else "s"
 
     options = {
         "use_doc_orientation_classify": st.sidebar.checkbox(
             "Document Orientation Classification",
-            value=USE_DOC_ORIENTATION_CLASSIFY,
+            value=True if OCR_QUALITY_FIRST else USE_DOC_ORIENTATION_CLASSIFY,
+            key=f"opt_orient_{mode_key}",
             help="Automatically detect and correct document orientation",
         ),
         "use_doc_unwarping": st.sidebar.checkbox(
             "Document Unwarping",
-            value=USE_DOC_UNWARPING,
+            value=True if OCR_QUALITY_FIRST else USE_DOC_UNWARPING,
+            key=f"opt_unwarp_{mode_key}",
             help="Correct curved or warped document images",
         ),
         "use_layout_detection": st.sidebar.checkbox(
             "Layout Detection",
-            value=USE_LAYOUT_DETECTION,
+            value=True if OCR_QUALITY_FIRST else USE_LAYOUT_DETECTION,
+            key=f"opt_layout_{mode_key}",
             help="Detect document layout structure (recommended)",
         ),
         "use_chart_recognition": st.sidebar.checkbox(
             "Chart Recognition",
-            value=USE_CHART_RECOGNITION,
+            value=True if OCR_QUALITY_FIRST else USE_CHART_RECOGNITION,
+            key=f"opt_chart_{mode_key}",
             help="Enable chart and diagram recognition",
         ),
         "prettify_markdown": st.sidebar.checkbox(

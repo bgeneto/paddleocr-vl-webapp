@@ -1,7 +1,7 @@
-# Speed-first PaddleX pipeline for PaddleOCR-VL-1.6 with llama-cpp-server.
-# Default when OCR_QUALITY_FIRST is unset/false. Quality YAML:
-# pipeline_config_llamacpp_quality.yaml (see compose.llamacpp.yaml).
-# max_concurrency is rewritten at startup from LLAMA_N_PARALLEL.
+# Quality-first PaddleX pipeline for PaddleOCR-VL-1.6 + vLLM.
+# Selected when OCR_QUALITY_FIRST=true (see compose.yaml).
+# Flags match modal-paddleocr: preprocessor, chart/seal, image-block OCR,
+# high-recall layout, keep headers/footnotes.
 
 pipeline_name: PaddleOCR-VL-1.6
 
@@ -9,20 +9,15 @@ batch_size: 64
 
 use_queues: True
 
-use_doc_preprocessor: False
+use_doc_preprocessor: True
 use_layout_detection: True
-use_chart_recognition: False
-use_seal_recognition: False
+use_chart_recognition: True
+use_seal_recognition: True
+use_ocr_for_image_block: True
 format_block_content: False
 merge_layout_blocks: True
-markdown_ignore_labels:
-  - number
-  - footnote
-  - header
-  - header_image
-  - footer
-  - footer_image
-  - aside_text
+# Empty list keeps headers, footnotes, page numbers, and asides in Markdown.
+markdown_ignore_labels: []
 
 SubModules:
   LayoutDetection:
@@ -30,17 +25,17 @@ SubModules:
     model_name: PP-DocLayoutV3
     model_dir: null
     batch_size: 8
-    threshold: 0.3
-    layout_nms: True
-    layout_unclip_ratio: [1.0, 1.0]
+    threshold: 0.2
+    layout_nms: False
+    layout_unclip_ratio: [1.08, 1.12]
     layout_merge_bboxes_mode:
       0: "union" # abstract
       1: "union" # algorithm
       2: "union" # aside_text
-      3: "large" # chart
+      3: "union" # chart
       4: "union" # content
-      5: "large" # display_formula
-      6: "large" # doc_title
+      5: "union" # display_formula
+      6: "union" # doc_title
       7: "union" # figure_title
       8: "union" # footer
       9: "union" # footer
@@ -49,9 +44,9 @@ SubModules:
       12: "union" # header
       13: "union" # header
       14: "union" # image
-      15: "large" # inline_formula
+      15: "union" # inline_formula
       16: "union" # number
-      17: "large" # paragraph_title
+      17: "union" # paragraph_title
       18: "union" # reference
       19: "union" # reference_content
       20: "union" # seal
@@ -65,9 +60,8 @@ SubModules:
     model_dir: null
     batch_size: 4096
     genai_config:
-      backend: llama-cpp-server
+      backend: vllm-server
       server_url: http://paddleocr-vlm-server:8080/v1
-      max_concurrency: 8
 
 SubPipelines:
   DocPreprocessor:
