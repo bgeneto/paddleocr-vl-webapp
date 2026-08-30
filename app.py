@@ -344,6 +344,77 @@ class CancellationError(Exception):
     pass
 
 
+class OcrJob:
+    """Thread-safe OCR job so Streamlit can keep Cancel clickable while workers run.
+
+    Streamlit will not handle widget clicks while the script is blocked in an
+    HTTP / thread-pool wait. The worker updates this object; the script only
+    reads snapshots and sets ``cancel_event``.
+    """
+
+    def __init__(self) -> None:
+        self.cancel_event = threading.Event()
+        self._lock = threading.RLock()
+        self.status = "running"  # running | cancelling | done | cancelled | error
+        self.current_file = ""
+        self.progress = (0, 0)
+        self.results: dict[str, dict] = {}
+        self.messages: list[tuple[str, str]] = []
+        self.error: str | None = None
+
+    def request_cancel(self) -> None:
+        self.cancel_event.set()
+        with self._lock:
+            if self.status == "running":
+                self.status = "cancelling"
+
+    def set_current_file(self, name: str) -> None:
+        with self._lock:
+            self.current_file = name
+
+    def set_progress(self, current: int, total: int) -> None:
+        with self._lock:
+            self.progress = (current, total)
+
+    def add_message(self, level: str, text: str) -> None:
+        with self._lock:
+            self.messages.append((level, text))
+
+    def store_result(self, file_key: str, result: dict) -> None:
+        with self._lock:
+            self.results[file_key] = result
+
+    def finish(self, status: str, error: str | None = None) -> None:
+        with self._lock:
+            self.status = status
+            if error:
+                self.error = error
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "status": self.status,
+                "current_file": self.current_file,
+                "progress": self.progress,
+                "results": dict(self.results),
+                "messages": list(self.messages),
+                "error": self.error,
+            }
+
+
+def _on_start_ocr() -> None:
+    """Runs before widgets render so Cancel is enabled on the Start-OCR rerun."""
+    st.session_state.is_processing = True
+    st.session_state.start_ocr_requested = True
+
+
+def _on_cancel_ocr() -> None:
+    """Runs before widgets render so the worker sees cancel on this rerun."""
+    job = st.session_state.get("ocr_job")
+    if job is not None:
+        job.request_cancel()
+
+
 # HTTP Session with connection pooling for better performance
 def create_http_session() -> requests.Session:
     """Create an HTTP session with connection pooling and retry logic."""
@@ -1155,6 +1226,393 @@ def create_download_zip(markdown_text: str, images: dict, base_filename: str) ->
     return zip_buffer.getvalue()
 
 
+def _flash_ocr_messages(messages: list[tuple[str, str]]) -> None:
+    """Render worker/UI status lines with the matching Streamlit call."""
+    for level, text in messages:
+        if level == "info":
+            st.info(text)
+        elif level == "warning":
+            st.warning(text)
+        elif level == "error":
+            st.error(text)
+        elif level == "success":
+            st.success(text)
+        else:
+            st.write(text)
+
+
+def _render_ocr_job_progress(snapshot: dict) -> None:
+    """Progress UI for a background job. Safe to call from a fragment."""
+    _flash_ocr_messages(snapshot["messages"])
+    if snapshot["status"] == "cancelling":
+        st.warning(
+            "⏹️ Cancellation requested — waiting for the current pages to finish."
+        )
+    name = snapshot["current_file"] or "document"
+    current, total = snapshot["progress"]
+    if total:
+        ratio = min(1.0, max(0.0, current / total if total else 0.0))
+        st.progress(ratio, text=f"{name}: page {current}/{total}...")
+    else:
+        st.caption(f"Working on {name}…")
+
+
+def _ocr_job_poll_tick() -> None:
+    """One progress refresh; used as a Streamlit fragment body."""
+    live = st.session_state.get("ocr_job")
+    if live is None:
+        return
+    snap = live.snapshot()
+    _render_ocr_job_progress(snap)
+    if snap["status"] not in ("running", "cancelling"):
+        try:
+            st.rerun(scope="app")
+        except TypeError:
+            st.rerun()
+
+
+def _poll_ocr_job_until_idle() -> None:
+    """Refresh progress without blocking the script on OCR (keeps Cancel live)."""
+    fragment = getattr(st, "fragment", None)
+    if fragment is not None:
+        fragment(run_every=0.6)(_ocr_job_poll_tick)()
+        return
+
+    _ocr_job_poll_tick()
+    live = st.session_state.get("ocr_job")
+    if live is not None and live.snapshot()["status"] in ("running", "cancelling"):
+        time.sleep(0.5)
+        st.rerun()
+
+
+def _job_is_active(job: OcrJob | None) -> bool:
+    if job is None:
+        return False
+    return job.snapshot()["status"] in ("running", "cancelling")
+
+
+def _sync_ocr_job_into_session() -> dict | None:
+    """Copy worker results into session_state. Drop the job when it has finished."""
+    job = st.session_state.get("ocr_job")
+    if job is None:
+        return None
+    snap = job.snapshot()
+    for file_key, result in snap["results"].items():
+        st.session_state.processing_results[file_key] = result
+    if snap["status"] in ("done", "cancelled", "error"):
+        messages = list(snap["messages"])
+        if snap["error"]:
+            messages.append(("error", snap["error"]))
+        if snap["status"] == "cancelled" and not any(
+            "cancel" in text.lower() for _, text in messages
+        ):
+            messages.append(
+                (
+                    "warning",
+                    "Processing cancelled. Completed pages were saved to disk. "
+                    "Click Start OCR again with the same file and options to resume.",
+                )
+            )
+        st.session_state.last_ocr_messages = messages
+        st.session_state.is_processing = False
+        st.session_state.ocr_job = None
+        return None
+    return snap
+
+
+def _prepare_files_for_job(
+    valid_files: list, options_fp: str
+) -> tuple[list[dict], list[tuple[str, str]]]:
+    """Load session/disk cache on the script thread; return files that need the API."""
+    to_process: list[dict] = []
+    messages: list[tuple[str, str]] = []
+    for uploaded_file, file_content, file_hash in valid_files:
+        file_key = f"{uploaded_file.name}_{uploaded_file.size}"
+        cached = st.session_state.processing_results.get(file_key)
+        if cached is not None and cached.get("fingerprint") == options_fp:
+            if cached.get("from_disk_cache"):
+                messages.append(
+                    (
+                        "info",
+                        f"{uploaded_file.name}: restored from the disk cache "
+                        "(change processing options to reprocess).",
+                    )
+                )
+            else:
+                messages.append(
+                    (
+                        "info",
+                        f"{uploaded_file.name}: using cached results. Re-upload to reprocess.",
+                    )
+                )
+            continue
+        disk_hit = load_cached_result(file_hash, options_fp)
+        if disk_hit is not None:
+            st.session_state.processing_results[file_key] = disk_hit
+            messages.append(
+                (
+                    "success",
+                    f"{uploaded_file.name}: instant from disk cache — previously "
+                    "processed with these options.",
+                )
+            )
+            continue
+        to_process.append(
+            {
+                "file_key": file_key,
+                "name": uploaded_file.name,
+                "content": file_content,
+                "hash": file_hash,
+                "is_pdf": uploaded_file.name.lower().endswith(".pdf"),
+            }
+        )
+    return to_process, messages
+
+
+def _process_one_file_for_job(
+    job: OcrJob, spec: dict, options: dict, options_fp: str
+) -> dict:
+    """OCR one file on the worker thread. Must not call Streamlit APIs."""
+    filename = spec["name"]
+    file_content = spec["content"]
+    file_hash = spec["hash"]
+    is_pdf = spec["is_pdf"]
+    start_time = time.time()
+    page_count = 0
+
+    if is_pdf:
+        page_count = get_pdf_page_count(file_content)
+        cached_pages = load_completed_pages(file_hash, options_fp)
+        already_done = sum(1 for p in cached_pages if 0 <= p < page_count)
+        if already_done and already_done < page_count:
+            job.add_message(
+                "info",
+                f"{filename}: resuming {already_done}/{page_count} pages already "
+                "cached. Only remaining pages will be sent to the API.",
+            )
+        elif already_done == page_count and page_count > 0:
+            job.add_message(
+                "info",
+                f"{filename}: assembling {page_count} cached pages into the final result.",
+            )
+        job.set_progress(already_done, page_count)
+
+        api_response = process_pdf_in_batches(
+            file_content=file_content,
+            filename=filename,
+            progress_callback=job.set_progress,
+            cancel_event=job.cancel_event,
+            file_hash=file_hash,
+            fingerprint=options_fp,
+            **options,
+        )
+    else:
+        if job.cancel_event.is_set():
+            raise CancellationError("Processing cancelled")
+        page_count = 1
+        job.set_progress(0, 1)
+        api_response = process_document(
+            file_content=file_content,
+            filename=filename,
+            **options,
+        )
+        job.set_progress(1, 1)
+
+    base_filename = display_stem(filename)
+    markdown_text, images = extract_markdown_from_response(
+        api_response, base_filename
+    )
+    processing_time = time.time() - start_time
+    job.add_message(
+        "success", f"{filename}: processed in {processing_time:.1f} seconds"
+    )
+
+    save_result_to_disk(
+        hash_str=file_hash,
+        fingerprint=options_fp,
+        display_name=filename,
+        markdown_text=markdown_text,
+        images=images,
+        page_count=page_count,
+        options=options,
+    )
+    return {
+        "markdown": markdown_text,
+        "images": images,
+        "response": api_response,
+        "display_name": filename,
+        "fingerprint": options_fp,
+    }
+
+
+def _run_ocr_job(
+    job: OcrJob, files: list[dict], options: dict, options_fp: str
+) -> None:
+    """Background OCR loop. Never calls Streamlit."""
+    try:
+        for spec in files:
+            if job.cancel_event.is_set():
+                job.add_message(
+                    "warning", "Skipping remaining files due to cancellation."
+                )
+                break
+            job.set_current_file(spec["name"])
+            try:
+                result = _process_one_file_for_job(job, spec, options, options_fp)
+                job.store_result(spec["file_key"], result)
+            except CancellationError as e:
+                job.add_message("warning", str(e))
+                if spec["is_pdf"]:
+                    job.add_message(
+                        "info",
+                        "Completed pages were saved to disk. Click Start OCR again "
+                        "with the same file and options to resume.",
+                    )
+                job.finish("cancelled")
+                return
+            except requests.Timeout:
+                job.add_message(
+                    "error",
+                    f"{spec['name']}: timed out after {API_TIMEOUT} seconds. "
+                    "Try processing smaller files or increase timeout.",
+                )
+                continue
+            except requests.RequestException as e:
+                job.add_message("error", f"{spec['name']}: network error: {e}")
+                continue
+            except RuntimeError as e:
+                job.add_message("error", f"{spec['name']}: {e}")
+                if spec["is_pdf"] and "no pages" not in str(e).lower():
+                    job.add_message(
+                        "info",
+                        "Successfully processed pages were saved. Click Start OCR "
+                        "again with the same file and options to resume.",
+                    )
+                continue
+            except Exception as e:
+                logger.exception("OCR failed for %s", spec["name"])
+                job.add_message(
+                    "error", f"{spec['name']}: unexpected error: {e}"
+                )
+                continue
+
+        if job.cancel_event.is_set():
+            job.finish("cancelled")
+        else:
+            job.finish("done")
+    except Exception as e:
+        logger.exception("OCR job failed")
+        job.finish("error", str(e))
+
+
+def display_ocr_file_output(
+    file_key: str,
+    display_name: str,
+    markdown_text: str,
+    images: dict,
+    options: dict,
+    cached: dict,
+) -> None:
+    """Preview / raw markdown / download tabs for one finished file."""
+    tab_preview, tab_raw, tab_download = st.tabs(
+        ["📖 Preview", "📝 Raw Markdown", "💾 Download"]
+    )
+
+    with tab_preview:
+        page_separators = markdown_text.count("\n\n---\n\n")
+        total_pages = page_separators + 1 if page_separators > 0 else 1
+
+        if total_pages > MAX_PREVIEW_PAGES:
+            pages = markdown_text.split("\n\n---\n\n")
+            truncated_md = "\n\n---\n\n".join(pages[:MAX_PREVIEW_PAGES])
+
+            st.warning(
+                f"⚠️ Showing preview of first {MAX_PREVIEW_PAGES} pages only "
+                f"(document has {total_pages} pages). Use 'Raw Markdown' tab or download for full content."
+            )
+            st.markdown(truncated_md)
+
+            with st.expander(f"📄 Show all {total_pages} pages (may be slow)"):
+                st.markdown(markdown_text)
+        else:
+            st.markdown(markdown_text)
+
+        if images:
+            st.subheader("🖼️ Extracted Images")
+            max_images_preview = MAX_PREVIEW_PAGES * 3
+            images_list = list(images.items())
+            display_images = images_list[:max_images_preview]
+
+            cols = st.columns(min(len(display_images), 3))
+            for idx, (img_path, img_data) in enumerate(display_images):
+                with cols[idx % 3]:
+                    img_bytes = decode_base64_image(img_data)
+                    st.image(img_bytes, caption=img_path, width="stretch")
+
+            if len(images_list) > max_images_preview:
+                st.info(
+                    f"📷 Showing {max_images_preview} of {len(images_list)} images. "
+                    "Download ZIP for all images."
+                )
+
+    with tab_raw:
+        st.code(markdown_text, language="markdown")
+
+    with tab_download:
+        base_filename = display_stem(display_name)
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.download_button(
+                label="📄 Download Markdown (.md)",
+                data=markdown_text.encode("utf-8"),
+                file_name=f"{base_filename}.md",
+                mime="text/markdown",
+                key=f"dl_md_{file_key}",
+            )
+
+        with col2:
+            if images:
+                zip_data = create_download_zip(
+                    markdown_text, images, base_filename
+                )
+                st.download_button(
+                    label="📦 Download ZIP (with images)",
+                    data=zip_data,
+                    file_name=f"{base_filename}_ocr_result.zip",
+                    mime="application/zip",
+                    key=f"dl_zip_{file_key}",
+                )
+            else:
+                st.info("No images to include in ZIP")
+
+    if options["visualize"]:
+        if cached.get("from_disk_cache"):
+            st.caption(
+                "🔍 Visualization images are not stored in the disk cache. "
+                "Reprocess the file to view them."
+            )
+        else:
+            response = cached.get("response", {})
+            result = response.get("result", {})
+            parsing_results = result.get("layoutParsingResults", [])
+
+            for page_result in parsing_results:
+                output_images = page_result.get("outputImages", {})
+                if output_images:
+                    st.subheader("🔍 Processing Visualization")
+                    vis_cols = st.columns(min(len(output_images), 2))
+                    for idx, (img_name, img_data) in enumerate(output_images.items()):
+                        if img_data:
+                            with vis_cols[idx % 2]:
+                                img_bytes = decode_base64_image(img_data)
+                                st.image(
+                                    img_bytes,
+                                    caption=img_name.replace("_", " ").title(),
+                                    width="stretch",
+                                )
+
+
 def display_processing_options() -> dict:
     """Display and collect processing options from sidebar."""
     st.sidebar.header("⚙️ Processing Options")
@@ -1216,9 +1674,13 @@ def main():
     st.title(f"📄 {APP_TITLE}")
     st.markdown(APP_DESCRIPTION)
 
-    # Check API health
-    with st.spinner("Checking API service status..."):
-        api_healthy = check_api_health()
+    # Skip the health probe while a job is running so Cancel/progress reruns
+    # are not blocked on a /health round-trip.
+    if _job_is_active(st.session_state.get("ocr_job")):
+        api_healthy = True
+    else:
+        with st.spinner("Checking API service status..."):
+            api_healthy = check_api_health()
 
     if not api_healthy:
         st.error(
@@ -1258,9 +1720,21 @@ def main():
         st.session_state.processing_results = {}
     if "files_to_process" not in st.session_state:
         st.session_state.files_to_process = {}
-    if "cancel_requested" not in st.session_state:
-        st.session_state.cancel_requested = False
     if "is_processing" not in st.session_state:
+        st.session_state.is_processing = False
+    if "start_ocr_requested" not in st.session_state:
+        st.session_state.start_ocr_requested = False
+    if "ocr_job" not in st.session_state:
+        st.session_state.ocr_job = None
+    if "last_ocr_messages" not in st.session_state:
+        st.session_state.last_ocr_messages = []
+
+    _sync_ocr_job_into_session()
+    if (
+        st.session_state.is_processing
+        and not st.session_state.start_ocr_requested
+        and not _job_is_active(st.session_state.get("ocr_job"))
+    ):
         st.session_state.is_processing = False
 
     # Store uploaded files content for processing
@@ -1297,337 +1771,122 @@ def main():
                 "fingerprint": options_fp,
             }
 
-    # Start OCR button
+    # Start OCR / Cancel — on_click runs before widgets so Cancel is enabled
+    # on the same rerun that starts the background job.
     st.header("🚀 Start Processing")
 
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
-        start_button = st.button(
+        st.button(
             "🔍 Start OCR",
             type="primary",
             disabled=st.session_state.is_processing,
             help="Process all uploaded documents with OCR",
+            on_click=_on_start_ocr,
+            key="start_ocr",
         )
     with col2:
-        cancel_button = st.button(
+        st.button(
             "⏹️ Cancel",
             type="secondary",
             disabled=not st.session_state.is_processing,
-            help="Cancel the current processing",
+            help="Stop after the current API chunk finishes. Completed pages are kept.",
+            on_click=_on_cancel_ocr,
+            key="cancel_ocr",
         )
     with col3:
-        st.caption(f"Ready to process {len(valid_files)} document(s)")
+        job = st.session_state.get("ocr_job")
+        if _job_is_active(job):
+            snap = job.snapshot()
+            if snap["status"] == "cancelling":
+                st.caption("Cancelling — waiting for current pages…")
+            else:
+                name = snap["current_file"] or "document"
+                current, total = snap["progress"]
+                if total:
+                    st.caption(f"Processing {name} ({current}/{total})")
+                else:
+                    st.caption(f"Processing {name}…")
+        else:
+            st.caption(f"Ready to process {len(valid_files)} document(s)")
 
-    # Handle cancel button
-    if cancel_button:
-        st.session_state.cancel_requested = True
-        st.warning("⏹️ Cancellation requested... waiting for current pages to finish.")
+    if st.session_state.start_ocr_requested:
+        st.session_state.start_ocr_requested = False
+        st.session_state.last_ocr_messages = []
+        to_process, cache_messages = _prepare_files_for_job(valid_files, options_fp)
+        if not to_process:
+            st.session_state.is_processing = False
+            st.session_state.last_ocr_messages = cache_messages
+        else:
+            job = OcrJob()
+            for level, text in cache_messages:
+                job.add_message(level, text)
+            st.session_state.ocr_job = job
+            threading.Thread(
+                target=_run_ocr_job,
+                args=(job, to_process, dict(options), options_fp),
+                daemon=True,
+                name="ocr-job",
+            ).start()
 
-    if not start_button:
-        st.info("👆 Click 'Start OCR' to begin processing your documents")
+    if _job_is_active(st.session_state.get("ocr_job")):
+        st.header("🔄 Processing Results")
+        _poll_ocr_job_until_idle()
+        st.markdown("---")
+        st.markdown(
+            "Built with [Streamlit](https://streamlit.io) and "
+            "[PaddleOCR-VL](https://github.com/PaddlePaddle/PaddleOCR)"
+        )
         return
 
-    # Reset cancel flag when starting new processing
-    st.session_state.cancel_requested = False
-    st.session_state.is_processing = True
-
-    # Processing section
+    # Results persist across reruns (tabs, downloads) instead of only the Start click.
     st.header("🔄 Processing Results")
+    if st.session_state.last_ocr_messages:
+        _flash_ocr_messages(st.session_state.last_ocr_messages)
+        st.session_state.last_ocr_messages = []
 
-    # Create a cancel event for thread communication
-    cancel_event = threading.Event()
-
-    for uploaded_file, file_content, file_hash in valid_files:
-        # Check for cancellation between files
-        if st.session_state.cancel_requested:
-            cancel_event.set()
-            st.warning("⏹️ Skipping remaining files due to cancellation.")
-            break
-
+    result_items: list[tuple[str, dict]] = []
+    for uploaded_file, _, _ in valid_files:
         file_key = f"{uploaded_file.name}_{uploaded_file.size}"
-        is_pdf = uploaded_file.name.lower().endswith(".pdf")
-
+        cached = st.session_state.processing_results.get(file_key)
+        if cached is None or cached.get("fingerprint") != options_fp:
+            continue
+        result_items.append((file_key, cached))
+        markdown_text = normalize_markdown_math(cached["markdown"])
+        cached["markdown"] = markdown_text
         with st.expander(f"📄 {uploaded_file.name}", expanded=True):
-            # Session cache is keyed by name+size; only reuse when options match.
-            # A fingerprint mismatch falls through to disk cache / reprocess.
-            cached = st.session_state.processing_results.get(file_key)
-            if cached is not None and cached.get("fingerprint") == options_fp:
-                if cached.get("from_disk_cache"):
-                    st.info(
-                        "📋 Using results restored from the disk cache (persisted from a previous run). "
-                        "Change the processing options to reprocess."
-                    )
-                else:
-                    st.info("📋 Using cached results. Re-upload to reprocess.")
-                markdown_text = normalize_markdown_math(cached["markdown"])
-                cached["markdown"] = markdown_text
-                images = cached["images"]
-            elif (disk_hit := load_cached_result(file_hash, options_fp)) is not None:
-                # Stored on disk from an earlier run - serve instantly, no API call
-                st.session_state.processing_results[file_key] = disk_hit
-                st.success(
-                    "⚡ Instant from disk cache — file previously processed with these options"
-                )
-                markdown_text = disk_hit["markdown"]
-                images = disk_hit["images"]
-            else:
-                try:
-                    start_time = time.time()
-                    page_count = 0
-
-                    if is_pdf:
-                        # Use batch processing for PDFs to handle all pages
-                        page_count = get_pdf_page_count(file_content)
-                        cached_pages = load_completed_pages(file_hash, options_fp)
-                        already_done = sum(
-                            1 for p in cached_pages if 0 <= p < page_count
-                        )
-
-                        if already_done and already_done < page_count:
-                            st.info(
-                                f"♻️ Resuming: {already_done}/{page_count} pages already "
-                                "cached. Only remaining pages will be sent to the API."
-                            )
-                        elif already_done == page_count and page_count > 0:
-                            st.info(
-                                f"♻️ Assembling {page_count} cached pages into the final result."
-                            )
-
-                        # Create containers for progress and cancel status
-                        progress_container = st.empty()
-                        initial_ratio = (
-                            already_done / page_count if page_count else 0.0
-                        )
-                        progress_bar = progress_container.progress(
-                            min(1.0, max(0.0, initial_ratio)),
-                            text=(
-                                f"Processing page {already_done}/{page_count}... "
-                                "(Cancel with button above)"
-                            ),
-                        )
-
-                        def update_progress(current, total):
-                            # Check cancel state from session
-                            if st.session_state.cancel_requested:
-                                cancel_event.set()
-                            ratio = current / total if total else 0
-                            progress_bar.progress(
-                                min(1.0, max(0.0, ratio)),
-                                text=f"Processing page {current}/{total}...",
-                            )
-
-                        api_response = process_pdf_in_batches(
-                            file_content=file_content,
-                            filename=uploaded_file.name,
-                            progress_callback=update_progress,
-                            cancel_event=cancel_event,
-                            file_hash=file_hash,
-                            fingerprint=options_fp,
-                            **options,
-                        )
-                        progress_container.empty()
-                    else:
-                        # Process single image directly
-                        page_count = 1
-                        with st.spinner(f"Processing {uploaded_file.name}..."):
-                            api_response = process_document(
-                                file_content=file_content,
-                                filename=uploaded_file.name,
-                                **options,
-                            )
-
-                    # Extract markdown with image paths rewritten to match ZIP structure
-                    base_filename = display_stem(uploaded_file.name)
-                    markdown_text, images = extract_markdown_from_response(api_response, base_filename)
-
-                    processing_time = time.time() - start_time
-                    st.success(f"✅ Processed in {processing_time:.1f} seconds")
-
-                    # Cache results (fingerprint so option changes miss this entry)
-                    st.session_state.processing_results[file_key] = {
-                        "markdown": markdown_text,
-                        "images": images,
-                        "response": api_response,
-                        "display_name": uploaded_file.name,
-                        "fingerprint": options_fp,
-                    }
-
-                    # Persist to disk for instant serving on re-upload (never raises)
-                    save_result_to_disk(
-                        hash_str=file_hash,
-                        fingerprint=options_fp,
-                        display_name=uploaded_file.name,
-                        markdown_text=markdown_text,
-                        images=images,
-                        page_count=page_count,
-                        options=options,
-                    )
-
-                except requests.Timeout:
-                    st.error(
-                        f"⏱️ Request timed out after {API_TIMEOUT} seconds. "
-                        "Try processing smaller files or increase timeout."
-                    )
-                    continue
-                except requests.RequestException as e:
-                    st.error(f"🌐 Network error: {str(e)}")
-                    continue
-                except CancellationError as e:
-                    st.warning(f"⏹️ {str(e)}")
-                    if is_pdf:
-                        st.info(
-                            "Completed pages were saved to disk. Click Start OCR again "
-                            "with the same file and options to resume."
-                        )
-                    st.session_state.is_processing = False
-                    st.stop()  # Stop further processing
-                except RuntimeError as e:
-                    st.error(f"❌ Processing error: {str(e)}")
-                    if is_pdf and "no pages" not in str(e).lower():
-                        st.info(
-                            "Successfully processed pages were saved. Click Start OCR again "
-                            "with the same file and options to resume."
-                        )
-                    continue
-                except Exception as e:
-                    st.error(f"❌ Unexpected error: {str(e)}")
-                    continue
-
-            # Display results in tabs
-            tab_preview, tab_raw, tab_download = st.tabs(
-                ["📖 Preview", "📝 Raw Markdown", "💾 Download"]
+            display_ocr_file_output(
+                file_key,
+                cached.get("display_name", uploaded_file.name),
+                markdown_text,
+                cached["images"],
+                options,
+                cached,
             )
 
-            with tab_preview:
-                # Count pages in markdown (separated by ---)
-                page_separators = markdown_text.count("\n\n---\n\n")
-                total_pages = page_separators + 1 if page_separators > 0 else 1
+    if not result_items:
+        st.info("👆 Click 'Start OCR' to begin processing your documents")
 
-                if total_pages > MAX_PREVIEW_PAGES:
-                    # Split by page separator and show only first N pages
-                    pages = markdown_text.split("\n\n---\n\n")
-                    truncated_md = "\n\n---\n\n".join(pages[:MAX_PREVIEW_PAGES])
-
-                    st.warning(
-                        f"⚠️ Showing preview of first {MAX_PREVIEW_PAGES} pages only "
-                        f"(document has {total_pages} pages). Use 'Raw Markdown' tab or download for full content."
-                    )
-                    st.markdown(truncated_md)
-
-                    # Optional: expandable full preview
-                    with st.expander(f"📄 Show all {total_pages} pages (may be slow)"):
-                        st.markdown(markdown_text)
-                else:
-                    st.markdown(markdown_text)
-
-                # Display embedded images if any (also limit images shown)
-                if images:
-                    st.subheader("🖼️ Extracted Images")
-                    max_images_preview = MAX_PREVIEW_PAGES * 3  # ~3 images per page max
-                    images_list = list(images.items())
-                    display_images = images_list[:max_images_preview]
-
-                    cols = st.columns(min(len(display_images), 3))
-                    for idx, (img_path, img_data) in enumerate(display_images):
-                        with cols[idx % 3]:
-                            img_bytes = decode_base64_image(img_data)
-                            st.image(img_bytes, caption=img_path, width="stretch")
-
-                    if len(images_list) > max_images_preview:
-                        st.info(
-                            f"📷 Showing {max_images_preview} of {len(images_list)} images. "
-                            "Download ZIP for all images."
-                        )
-
-            with tab_raw:
-                st.code(markdown_text, language="markdown")
-
-            with tab_download:
-                # Download names come from the display name stored with the
-                # result (the original upload name for disk-cache hits)
-                base_filename = display_stem(
-                    st.session_state.processing_results[file_key].get(
-                        "display_name", uploaded_file.name
-                    )
-                )
-
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    # Download markdown only
-                    st.download_button(
-                        label="📄 Download Markdown (.md)",
-                        data=markdown_text.encode("utf-8"),
-                        file_name=f"{base_filename}.md",
-                        mime="text/markdown",
-                    )
-
-                with col2:
-                    # Download as ZIP with images
-                    if images:
-                        zip_data = create_download_zip(
-                            markdown_text, images, base_filename
-                        )
-                        st.download_button(
-                            label="📦 Download ZIP (with images)",
-                            data=zip_data,
-                            file_name=f"{base_filename}_ocr_result.zip",
-                            mime="application/zip",
-                        )
-                    else:
-                        st.info("No images to include in ZIP")
-
-            # Display visualization if enabled and available
-            if options["visualize"] and file_key in st.session_state.processing_results:
-                cached = st.session_state.processing_results[file_key]
-                if cached.get("from_disk_cache"):
-                    st.caption(
-                        "🔍 Visualization images are not stored in the disk cache. "
-                        "Reprocess the file to view them."
-                    )
-                else:
-                    response = cached.get("response", {})
-                    result = response.get("result", {})
-                    parsing_results = result.get("layoutParsingResults", [])
-
-                    for page_result in parsing_results:
-                        output_images = page_result.get("outputImages", {})
-                        if output_images:
-                            st.subheader("🔍 Processing Visualization")
-                            vis_cols = st.columns(min(len(output_images), 2))
-                            for idx, (img_name, img_data) in enumerate(
-                                output_images.items()
-                            ):
-                                if img_data:
-                                    with vis_cols[idx % 2]:
-                                        img_bytes = decode_base64_image(img_data)
-                                        st.image(
-                                            img_bytes,
-                                            caption=img_name.replace("_", " ").title(),
-                                            width="stretch",
-                                        )
-
-    # Batch download section
-    if len(st.session_state.processing_results) > 1:
+    if len(result_items) > 1:
         st.header("📦 Batch Download")
-        if st.button("Download All Results as ZIP"):
+        if st.button("Download All Results as ZIP", key="batch_zip_prepare"):
             batch_zip_buffer = io.BytesIO()
             with zipfile.ZipFile(
                 batch_zip_buffer, "w", zipfile.ZIP_DEFLATED
             ) as batch_zip:
-                for file_key, data in st.session_state.processing_results.items():
+                for file_key, data in result_items:
                     base_name = display_stem(
                         data.get("display_name", file_key.rsplit("_", 1)[0])
                     )
-                    # Store each document in its own directory
                     batch_zip.writestr(
                         f"{base_name}/{base_name}.md", data["markdown"].encode("utf-8")
                     )
-                    # Images are stored to match markdown references: {base_name}_images/...
                     images_dir = f"{base_name}_images"
                     for img_path, img_data in data["images"].items():
                         img_bytes = decode_base64_image(img_data)
-                        batch_zip.writestr(f"{base_name}/{images_dir}/{img_path}", img_bytes)
+                        batch_zip.writestr(
+                            f"{base_name}/{images_dir}/{img_path}", img_bytes
+                        )
 
             batch_zip_buffer.seek(0)
             st.download_button(
@@ -1635,13 +1894,9 @@ def main():
                 data=batch_zip_buffer.getvalue(),
                 file_name="all_ocr_results.zip",
                 mime="application/zip",
+                key="batch_zip_download",
             )
 
-    # Reset processing state
-    st.session_state.is_processing = False
-    st.session_state.cancel_requested = False
-
-    # Footer
     st.markdown("---")
     st.markdown(
         "Built with [Streamlit](https://streamlit.io) and "
