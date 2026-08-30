@@ -2,7 +2,7 @@
 PaddleOCR-VL Document Parser Streamlit Application
 
 This application provides a web interface for document OCR using PaddleOCR-VL
-with vLLM backend for production-ready inference.
+(llama.cpp by default; vLLM via compose.vllm.yaml).
 """
 
 import base64
@@ -32,7 +32,7 @@ load_dotenv()
 APP_TITLE = os.getenv("APP_TITLE", "PaddleOCR-VL Document Parser")
 APP_DESCRIPTION = os.getenv(
     "APP_DESCRIPTION",
-    "Upload PDF or image files to convert them to Markdown using PaddleOCR-VL with vLLM backend",
+    "Upload PDF or image files to convert them to Markdown using PaddleOCR-VL",
 )
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "99"))
 MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "250"))
@@ -1645,7 +1645,7 @@ def main():
     st.markdown("---")
     st.markdown(
         "Built with [Streamlit](https://streamlit.io) and "
-        "[PaddleOCR-VL](https://github.com/PaddlePaddle/PaddleOCR) using vLLM backend"
+        "[PaddleOCR-VL](https://github.com/PaddlePaddle/PaddleOCR)"
     )
 
 

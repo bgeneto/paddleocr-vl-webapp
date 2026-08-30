@@ -1,26 +1,29 @@
-# PaddleOCR-VL Document Parser with vLLM Backend
+# PaddleOCR-VL Document Parser with llama.cpp Backend (default)
 #
-# This docker-compose file sets up a production-ready document OCR service using:
-# - PaddleOCR-VL API service with layout detection
-# - vLLM backend for accelerated VLM inference
-# - Streamlit web interface for user interaction
+# Default stack: `docker compose up -d`. vLLM is compose.vllm.yaml (-f).
+# Do not run both at once: they share STREAMLIT_HOST_PORT and typically the same GPU.
+#
+# VLM: llama-server (CUDA) with LunarOilRig Q4_K_M decoder + Q8_0 mmproj.
+# Pipeline: paddlex llama-cpp-server client (PaddleOCR >= 3.5).
 #
 # Requirements:
 # - Docker >= 19.03
-# - NVIDIA GPU with CUDA 12.6+ support
-# - Compute Capability >= 8.0 for vLLM (RTX 30/40/50 series, A10, A100, etc.)
+# - NVIDIA GPU + NVIDIA Container Toolkit
+# - First start needs network to download ~900 MB of GGUF files into ./models/llamacpp
 #
 # Usage:
 #   docker compose up -d
-#   # Access the app at http://localhost:8501
+#   docker compose logs -f paddleocr-vlm-server
+#   # Access the app at http://localhost:${STREAMLIT_HOST_PORT:-8501}
+
+name: paddleocr-vl-llamacpp
 
 services:
-  # Streamlit Web Application
   streamlit-app:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: paddleocr-vl-streamlit
+    container_name: paddleocr-vl-streamlit-llamacpp
     ports:
       - "${STREAMLIT_HOST_PORT:-8501}:8501"
     environment:
@@ -30,18 +33,16 @@ services:
       - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
       - STREAMLIT_THEME_BASE=light
       - DATA_DIR=${DATA_DIR:-/app/data}
-      # API Configuration
       - PADDLEOCR_VL_API_URL=http://paddleocr-vl-api:8080/layout-parsing
       - API_TIMEOUT=${API_TIMEOUT:-300}
-      # App Configuration
       - APP_TITLE=${APP_TITLE:-PaddleOCR-VL Document Parser}
-      - APP_DESCRIPTION=${APP_DESCRIPTION:-Upload PDF or image files to convert them to Markdown using PaddleOCR-VL with vLLM backend}
+      - APP_DESCRIPTION=Upload PDF or image files to convert them to Markdown using PaddleOCR-VL with llama.cpp (Q4 decoder + Q8 mmproj)
       - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-99}
       - MAX_PDF_PAGES=${MAX_PDF_PAGES:-250}
-      - MAX_PARALLEL_PAGES=${MAX_PARALLEL_PAGES:-2}
+      # llama.cpp-only throughput (do not reuse vLLM MAX_PARALLEL_PAGES / PAGES_PER_CHUNK)
+      - MAX_PARALLEL_PAGES=${LLAMA_MAX_PARALLEL_PAGES:-4}
       - MAX_PREVIEW_PAGES=${MAX_PREVIEW_PAGES:-10}
-      - PAGES_PER_CHUNK=${PAGES_PER_CHUNK:-16}
-      # Processing Options
+      - PAGES_PER_CHUNK=${LLAMA_PAGES_PER_CHUNK:-8}
       - USE_DOC_ORIENTATION_CLASSIFY=${USE_DOC_ORIENTATION_CLASSIFY:-false}
       - USE_DOC_UNWARPING=${USE_DOC_UNWARPING:-false}
       - USE_LAYOUT_DETECTION=${USE_LAYOUT_DETECTION:-true}
@@ -67,10 +68,9 @@ services:
     networks:
       - ocr-network
 
-  # PaddleOCR-VL API Service (Pipeline)
   paddleocr-vl-api:
     image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl:${API_IMAGE_TAG_SUFFIX:-latest-offline}
-    container_name: paddleocr-vl-api
+    container_name: paddleocr-vl-api-llamacpp
     deploy:
       resources:
         reservations:
@@ -81,20 +81,23 @@ services:
     user: root
     restart: unless-stopped
     environment:
-      - VLM_BACKEND=${VLM_BACKEND:-vllm}
+      - LLAMA_N_PARALLEL=${LLAMA_N_PARALLEL:-8}
       - OCR_QUALITY_FIRST=${OCR_QUALITY_FIRST:-false}
     volumes:
-      - ./pipeline_config_vllm_quality.yaml:/home/paddleocr/pipeline_config_quality.yaml:ro
+      - ./pipeline_config_llamacpp.yaml:/home/paddleocr/pipeline_config_speed.yaml:ro
+      - ./pipeline_config_llamacpp_quality.yaml:/home/paddleocr/pipeline_config_quality.yaml:ro
     command:
       - /bin/bash
       - -c
       - |
+        CFG=/home/paddleocr/pipeline_config_speed.yaml
         if [ "$${OCR_QUALITY_FIRST:-false}" = "true" ]; then
           echo "[startup] OCR_QUALITY_FIRST=true; serving quality pipeline YAML"
-          paddlex --serve --pipeline /home/paddleocr/pipeline_config_quality.yaml
-        else
-          paddlex --serve --pipeline /home/paddleocr/pipeline_config_$${VLM_BACKEND:-vllm}.yaml
+          CFG=/home/paddleocr/pipeline_config_quality.yaml
         fi
+        sed "s/max_concurrency: [0-9][0-9]*/max_concurrency: $${LLAMA_N_PARALLEL}/" \
+          "$$CFG" > /tmp/pipeline_config.yaml
+        paddlex --serve --pipeline /tmp/pipeline_config.yaml
     depends_on:
       paddleocr-vlm-server:
         condition: service_healthy
@@ -107,10 +110,10 @@ services:
     networks:
       - ocr-network
 
-  # VLM Inference Service (vLLM or FastDeploy)
+  # llama-server: Q4_K_M decoder + Q8_0 vision projector (OpenAI-compatible /v1)
   paddleocr-vlm-server:
-    image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-${VLM_BACKEND:-vllm}-server:${VLM_IMAGE_TAG_SUFFIX:-latest-nvidia-gpu-offline}
-    container_name: paddleocr-vlm-server
+    image: ${LLAMA_CPP_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda}
+    container_name: paddleocr-llama-server
     deploy:
       resources:
         reservations:
@@ -118,19 +121,38 @@ services:
             - driver: nvidia
               device_ids: ["${GPU_DEVICE_ID:-1}"]
               capabilities: [gpu]
-    user: root
     restart: unless-stopped
+    environment:
+      LLAMA_ARG_HOST: "0.0.0.0"
+      LLAMA_ARG_PORT: "8080"
+      LLAMA_ARG_MODEL: /models/PaddleOCR-VL-1.6-Q4_K_M.gguf
+      LLAMA_ARG_MMPROJ: /models/mmproj-Q8_0.gguf
+      # Used only by llama-server-entrypoint.sh on first start (not passed as --hf-*)
+      LLAMA_HF_REPO: ${LLAMA_HF_REPO:-LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4}
+      LLAMA_HF_FILE: ${LLAMA_HF_FILE:-PaddleOCR-VL-1.6-Q4_K_M.gguf}
+      LLAMA_MMPROJ_URL: ${LLAMA_MMPROJ_URL:-https://huggingface.co/LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4/resolve/main/mmproj-Q8_0.gguf}
+      HF_TOKEN: ${HF_TOKEN:-}
+      LLAMA_ARG_N_GPU_LAYERS: ${LLAMA_N_GPU_LAYERS:-99}
+      LLAMA_ARG_TEMP: "0"
+      LLAMA_ARG_JINJA: "1"
+      # Per-slot target; entrypoint sets LLAMA_ARG_CTX_SIZE = min(CTX_SIZE * N_PARALLEL, CTX_MAX)
+      LLAMA_CTX_SIZE: ${LLAMA_CTX_SIZE:-8192}
+      LLAMA_CTX_MAX: ${LLAMA_CTX_MAX:-131072}
+      LLAMA_ARG_N_PARALLEL: ${LLAMA_N_PARALLEL:-8}
+      LLAMA_ARG_FLASH_ATTN: on
+      # Entrypoint sets KV cache to q4_0 (speed) or q8_0 (OCR_QUALITY_FIRST=true)
+      OCR_QUALITY_FIRST: ${OCR_QUALITY_FIRST:-false}
+      # Default ubatch is 512; 2048 packs vision prefill in fewer GPU steps
+      LLAMA_ARG_UBATCH: ${LLAMA_UBATCH_SIZE:-2048}
+      # Headless OCR sidecar — no llama.cpp Web UI
+      LLAMA_ARG_UI: "0"
     volumes:
-      - ./vllm_config.yaml:/tmp/vllm_config.yaml:ro
-    command: >
-      paddleocr genai_server
-      --model_name PaddleOCR-VL-1.6-0.9B
-      --host 0.0.0.0
-      --port 8080
-      --backend ${VLM_BACKEND:-vllm}
-      --backend_config /tmp/vllm_config.yaml
+      - ./models/llamacpp:/models
+      - ./llama-server-entrypoint.sh:/entrypoint.sh:ro
+      - llama-cpp-cache:/root/.cache/llama.cpp
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 60s
       timeout: 30s
       retries: 5
@@ -139,7 +161,7 @@ services:
       - ocr-network
 
 volumes:
-  uploads:
+  llama-cpp-cache:
     driver: local
 
 networks:

@@ -1,13 +1,13 @@
 # PaddleOCR-VL Document Parser
 
-A production-ready Streamlit application that processes PDF and image files using **PaddleOCR-VL** with **vLLM backend** for state-of-the-art document parsing and OCR.
+A production-ready Streamlit application that processes PDF and image files using **PaddleOCR-VL** with a **llama.cpp** backend (Q4 decoder + Q8 mmproj) for state-of-the-art document parsing and OCR. A **vLLM** stack is available via `compose.vllm.yaml`.
 
 ## Features
 
 - 📄 **Multi-format Support**: Process PDF, PNG, JPG, JPEG, WEBP, TIFF, and BMP files
 - 🔍 **Document Preview**: Preview uploaded PDFs and images before OCR processing
 - 🤖 **Advanced Vision-Language Model**: Powered by PaddleOCR-VL-0.9B for accurate text, table, formula, and chart recognition
-- 🚀 **Production-Ready**: vLLM backend for optimized inference performance
+- 🚀 **Production-Ready**: llama.cpp (default) or vLLM backend for GPU inference
 - 📝 **Rich Markdown Output**: Convert complex documents to structured markdown with embedded images
 - 👀 **Live Preview**: View processed markdown directly in the browser
 - 💾 **Flexible Download**: Download as markdown files or ZIP archives with images
@@ -41,11 +41,11 @@ A production-ready Streamlit application that processes PDF and image files usin
 │  • Markdown generation                                               │
 └─────────────────────────────────────────────────────────────────────┘
                                 │
-                                ▼ vLLM API
+                                ▼ llama-server API
 ┌─────────────────────────────────────────────────────────────────────┐
-│                      vLLM Inference Service                         │
+│                   llama.cpp Inference Service                       │
 │            (paddleocr-vlm-server container - Port 8080)             │
-│  • PaddleOCR-VL-0.9B model inference                                │
+│  • PaddleOCR-VL-1.6 GGUF (Q4 decoder + Q8 mmproj)                   │
 │  • GPU-accelerated VLM processing                                    │
 │  • Text, table, formula, chart recognition                          │
 └─────────────────────────────────────────────────────────────────────┘
@@ -54,16 +54,16 @@ A production-ready Streamlit application that processes PDF and image files usin
 ## Requirements
 
 ### Hardware Requirements
-- **NVIDIA GPU** with Compute Capability ≥ 8.0 (RTX 30/40/50 series, A10, A100, etc.)
-- **GPU VRAM**: Minimum 8GB recommended (16GB+ for best performance)
+- **NVIDIA GPU** + NVIDIA Container Toolkit (layout detection uses GPU on both stacks)
+- **GPU VRAM**: llama.cpp default stack typically ~1–2 GB for the VLM; 8GB+ recommended overall
+- **vLLM stack** (`compose.vllm.yaml`): Compute Capability ≥ 8.0, CUDA 12.6+, 8GB+ VRAM (16GB+ preferred)
 - **System RAM**: 16GB minimum
-- **CUDA**: Version 12.6 or higher
 
 ### Software Requirements
 - Docker >= 19.03
 - Docker Compose >= 2.0
 - NVIDIA Container Toolkit (nvidia-docker)
-- NVIDIA Driver supporting CUDA 12.6+
+- NVIDIA Driver with NVIDIA Container Toolkit (vLLM stack: CUDA 12.6+)
 
 ## Quick Start
 
@@ -90,32 +90,36 @@ docker compose logs -f
 ### 4. Access the Application
 Open your browser to `http://localhost:8501`
 
-> **Note**: First startup may take 5-10 minutes as the VLM model loads into GPU memory. Check logs with `docker compose logs -f paddleocr-vlm-server` to monitor progress.
+> **Note**: First start downloads ~900 MB of GGUF files into `./models/llamacpp` on the host (set `HF_TOKEN` in `.env` for authenticated Hugging Face rate limits). Later starts reuse those files. Check logs with `docker compose logs -f paddleocr-vlm-server`.
 
 ### 5. Stop the Services
 ```bash
 docker compose down
 ```
 
-## Alternative: llama.cpp (Q4 decoder + Q8 mmproj)
+## Default stack (llama.cpp)
 
-A second Compose file runs the same Streamlit UI and PaddleOCR-VL API, but serves the VLM with [llama-server](https://github.com/ggml-org/llama.cpp) instead of vLLM. Weights are [LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4](https://huggingface.co/LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4): `PaddleOCR-VL-1.6-Q4_K_M.gguf` plus `mmproj-Q8_0.gguf`.
+The default stack uses [llama-server](https://github.com/ggml-org/llama.cpp) with [LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4](https://huggingface.co/LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4): `PaddleOCR-VL-1.6-Q4_K_M.gguf` plus `mmproj-Q8_0.gguf`. llama.cpp uses far less VRAM than vLLM (~1–2 GB for the VLM); the API container still needs a GPU for layout detection.
 
-Do **not** start this stack while the vLLM stack is running — they share `STREAMLIT_HOST_PORT` and typically the same GPU.
+Throughput is **not** `MAX_PARALLEL_PAGES` / `PAGES_PER_CHUNK` (those stay conservative for vLLM). Use `LLAMA_MAX_PARALLEL_PAGES`, `LLAMA_PAGES_PER_CHUNK`, and `LLAMA_N_PARALLEL` instead.
+
+The paddlex pipeline requires PaddleOCR ≥ 3.5 (`llama-cpp-server` backend). Use a current `API_IMAGE_TAG_SUFFIX` such as `latest-nvidia-gpu-offline`.
+
+## Alternative: vLLM
+
+A second Compose file runs the same Streamlit UI and PaddleOCR-VL API, but serves the VLM with vLLM (or FastDeploy via `VLM_BACKEND`).
+
+Do **not** start this stack while the llama.cpp stack is running — they share `STREAMLIT_HOST_PORT` and typically the same GPU.
 
 ```bash
-# Stop the vLLM stack first if it is up
+# Stop the default llama.cpp stack first if it is up
 docker compose down
 
-docker compose -f compose.llamacpp.yaml up -d
-docker compose -f compose.llamacpp.yaml logs -f paddleocr-vlm-server
+docker compose -f compose.vllm.yaml up -d
+docker compose -f compose.vllm.yaml logs -f paddleocr-vlm-server
 ```
 
-First start downloads ~900 MB of GGUF files into `./models/llamacpp` on the host. Later starts load those files and do not hit Hugging Face. Set `HF_TOKEN` in `.env` (a [read token](https://huggingface.co/settings/tokens)) so the first download uses authenticated Hugging Face rate limits. llama.cpp uses far less VRAM than vLLM (~1–2 GB for the VLM); the API container still needs a GPU for layout detection.
-
-Throughput for this stack is **not** `MAX_PARALLEL_PAGES` / `PAGES_PER_CHUNK` (those stay conservative for vLLM). Use `LLAMA_MAX_PARALLEL_PAGES`, `LLAMA_PAGES_PER_CHUNK`, and `LLAMA_N_PARALLEL` instead.
-
-The paddlex pipeline in this stack requires PaddleOCR ≥ 3.5 (`llama-cpp-server` backend). Use a current `API_IMAGE_TAG_SUFFIX` such as `latest-nvidia-gpu-offline`.
+First vLLM startup may take 5–10 minutes as the model loads into GPU memory. This stack needs Compute Capability ≥ 8.0 and more VRAM than llama.cpp.
 
 ## Configuration
 
@@ -144,7 +148,7 @@ Set `OCR_QUALITY_FIRST=true` in `.env`, then recreate so the API loads the quali
 
 ```bash
 docker compose up -d --force-recreate
-# or: docker compose -f compose.llamacpp.yaml up -d --force-recreate
+# or: docker compose -f compose.vllm.yaml up -d --force-recreate
 ```
 
 Speed-first (`false`) is unchanged: same YAML, same request body, same cache keys.
@@ -152,7 +156,7 @@ Speed-first (`false`) is unchanged: same YAML, same request body, same cache key
 ### Docker/Infrastructure
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VLM_BACKEND` | vllm | Backend for `compose.yaml`: `vllm` or `fastdeploy` |
+| `VLM_BACKEND` | vllm | Backend for `compose.vllm.yaml` only: `vllm` or `fastdeploy` |
 | `GPU_DEVICE_ID` | 0 | GPU device to use |
 | `STREAMLIT_HOST_PORT` | 8501 | External port for Streamlit |
 | `API_IMAGE_TAG_SUFFIX` | latest-offline | Docker image tag |
@@ -250,8 +254,8 @@ docker compose logs paddleocr-vlm-server
 docker compose logs paddleocr-vl-api
 docker compose logs streamlit-app
 
-# llama.cpp stack (use the matching compose file)
-docker compose -f compose.llamacpp.yaml logs paddleocr-vlm-server
+# vLLM stack (use the matching compose file)
+docker compose -f compose.vllm.yaml logs paddleocr-vlm-server
 ```
 
 ### GPU Not Detected
@@ -304,8 +308,8 @@ docker run -p 8501:8501 \
 streamlit_ocr_app/
 ├── app.py                         # Streamlit application
 ├── Dockerfile                     # Frontend container definition
-├── compose.yaml                   # vLLM stack
-├── compose.llamacpp.yaml          # llama.cpp stack (Q4 decoder + Q8 mmproj)
+├── compose.yaml                   # llama.cpp stack (default; Q4 decoder + Q8 mmproj)
+├── compose.vllm.yaml              # vLLM stack (`docker compose -f compose.vllm.yaml`)
 ├── pipeline_config_llamacpp.yaml  # paddlex pipeline for llama-cpp-server
 ├── vllm_config.yaml               # vLLM memory/performance config
 ├── requirements.txt               # Python dependencies

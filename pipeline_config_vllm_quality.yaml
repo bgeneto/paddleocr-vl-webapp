@@ -1,5 +1,5 @@
 # Quality-first PaddleX pipeline for PaddleOCR-VL-1.6 + vLLM.
-# Selected when OCR_QUALITY_FIRST=true (see compose.yaml).
+# Selected when OCR_QUALITY_FIRST=true (see compose.vllm.yaml).
 # Flags match modal-paddleocr: preprocessor, chart/seal, image-block OCR,
 # high-recall layout, keep headers/footnotes.
 

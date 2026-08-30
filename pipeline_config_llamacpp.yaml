@@ -1,6 +1,6 @@
 # Speed-first PaddleX pipeline for PaddleOCR-VL-1.6 with llama-cpp-server.
 # Default when OCR_QUALITY_FIRST is unset/false. Quality YAML:
-# pipeline_config_llamacpp_quality.yaml (see compose.llamacpp.yaml).
+# pipeline_config_llamacpp_quality.yaml (see compose.yaml).
 # max_concurrency is rewritten at startup from LLAMA_N_PARALLEL.
 
 pipeline_name: PaddleOCR-VL-1.6

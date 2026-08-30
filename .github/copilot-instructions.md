@@ -5,12 +5,13 @@
 This is a **three-tier Docker Compose application** for document OCR:
 
 ```
-Streamlit UI (app.py:8501) → PaddleOCR-VL API (:8080) → vLLM Inference Server
+Streamlit UI (app.py:8501) → PaddleOCR-VL API (:8080) → llama.cpp llama-server
 ```
 
 - **Frontend**: Single-file Streamlit app (`app.py`) - handles file upload, preview, and results display
 - **API Service**: PaddleX container with PP-DocLayoutV2 for layout detection and markdown generation
-- **VLM Backend**: vLLM or FastDeploy serving PaddleOCR-VL-0.9B model (GPU-accelerated)
+- **VLM Backend (default)**: llama.cpp (`compose.yaml`) serving PaddleOCR-VL GGUF (Q4 decoder + Q8 mmproj)
+- **VLM Backend (optional)**: vLLM or FastDeploy via `docker compose -f compose.vllm.yaml`
 
 ## Key Code Patterns
 
@@ -82,7 +83,8 @@ Edit `vllm_config.yaml` for memory issues:
 ## File Organization
 
 - `app.py` - **Single source file** for entire Streamlit app (~950 lines)
-- `compose.yaml` - Multi-container orchestration with health checks
+- `compose.yaml` - Default llama.cpp stack
+- `compose.vllm.yaml` - vLLM/FastDeploy stack (`docker compose -f compose.vllm.yaml`)
 - `vllm_config.yaml` - vLLM memory/batching configuration
 - `requirements.txt` - Minimal deps (streamlit, requests, PyMuPDF, Pillow)
 
