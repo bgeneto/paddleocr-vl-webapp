@@ -61,6 +61,8 @@ Thumbs.db
 *.pdiparams
 *.pt
 *.pth
+*.gguf
+models/
 
 # Uploaded files
 uploads/

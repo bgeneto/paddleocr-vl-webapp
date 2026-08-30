@@ -97,6 +97,26 @@ Open your browser to `http://localhost:8501`
 docker compose down
 ```
 
+## Alternative: llama.cpp (Q4 decoder + Q8 mmproj)
+
+A second Compose file runs the same Streamlit UI and PaddleOCR-VL API, but serves the VLM with [llama-server](https://github.com/ggml-org/llama.cpp) instead of vLLM. Weights are [LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4](https://huggingface.co/LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4): `PaddleOCR-VL-1.6-Q4_K_M.gguf` plus `mmproj-Q8_0.gguf`.
+
+Do **not** start this stack while the vLLM stack is running — they share `STREAMLIT_HOST_PORT` and typically the same GPU.
+
+```bash
+# Stop the vLLM stack first if it is up
+docker compose down
+
+docker compose -f compose.llamacpp.yaml up -d
+docker compose -f compose.llamacpp.yaml logs -f paddleocr-vlm-server
+```
+
+First start downloads ~900 MB of GGUF files into a Docker volume (`llama-cpp-cache`). Later starts are offline. llama.cpp uses far less VRAM than vLLM (~1–2 GB for the VLM); the API container still needs a GPU for layout detection.
+
+Throughput for this stack is **not** `MAX_PARALLEL_PAGES` / `PAGES_PER_CHUNK` (those stay conservative for vLLM). Use `LLAMA_MAX_PARALLEL_PAGES`, `LLAMA_PAGES_PER_CHUNK`, and `LLAMA_N_PARALLEL` instead.
+
+The paddlex pipeline in this stack requires PaddleOCR ≥ 3.5 (`llama-cpp-server` backend). Use a current `API_IMAGE_TAG_SUFFIX` such as `latest-nvidia-gpu-offline`.
+
 ## Configuration
 
 All configuration is done via environment variables. Copy `.env.example` to `.env` and customize:
@@ -122,11 +142,15 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 ### Docker/Infrastructure
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VLM_BACKEND` | vllm | Backend: `vllm` or `fastdeploy` |
+| `VLM_BACKEND` | vllm | Backend for `compose.yaml`: `vllm` or `fastdeploy` |
 | `GPU_DEVICE_ID` | 0 | GPU device to use |
 | `STREAMLIT_HOST_PORT` | 8501 | External port for Streamlit |
 | `API_IMAGE_TAG_SUFFIX` | latest-offline | Docker image tag |
-| `VLM_IMAGE_TAG_SUFFIX` | latest-offline | VLM image tag |
+| `VLM_IMAGE_TAG_SUFFIX` | latest-offline | VLM image tag (vLLM/FastDeploy stack) |
+| `LLAMA_CTX_SIZE` | 8192 | llama.cpp context size (`compose.llamacpp.yaml`) |
+| `LLAMA_MAX_PARALLEL_PAGES` | 4 | Streamlit concurrent API workers for the llama.cpp stack |
+| `LLAMA_PAGES_PER_CHUNK` | 8 | Pages per API request on the llama.cpp stack |
+| `LLAMA_N_PARALLEL` | 8 | llama-server slots and paddlex VLM `max_concurrency` |
 
 ## Persistence & Caching
 
@@ -210,6 +234,9 @@ docker compose ps
 docker compose logs paddleocr-vlm-server
 docker compose logs paddleocr-vl-api
 docker compose logs streamlit-app
+
+# llama.cpp stack (use the matching compose file)
+docker compose -f compose.llamacpp.yaml logs paddleocr-vlm-server
 ```
 
 ### GPU Not Detected
@@ -260,18 +287,20 @@ docker run -p 8501:8501 \
 
 ```
 streamlit_ocr_app/
-├── app.py                 # Streamlit application
-├── Dockerfile             # Frontend container definition
-├── docker-compose.yaml    # Multi-service orchestration
-├── vllm_config.yaml       # vLLM memory/performance config
-├── requirements.txt       # Python dependencies
-├── .env.example           # Configuration template
-├── .env                   # Local configuration (not in git)
-├── .gitignore             # Git ignore rules
-├── .dockerignore          # Docker build ignore rules
-├── data/                  # Processed results cache (gitignored, bind-mounted in Docker)
-├── README.md              # This file
-└── logs/                  # Application logs
+├── app.py                         # Streamlit application
+├── Dockerfile                     # Frontend container definition
+├── compose.yaml                   # vLLM stack
+├── compose.llamacpp.yaml          # llama.cpp stack (Q4 decoder + Q8 mmproj)
+├── pipeline_config_llamacpp.yaml  # paddlex pipeline for llama-cpp-server
+├── vllm_config.yaml               # vLLM memory/performance config
+├── requirements.txt               # Python dependencies
+├── .env.example                   # Configuration template
+├── .env                           # Local configuration (not in git)
+├── .gitignore                     # Git ignore rules
+├── .dockerignore                  # Docker build ignore rules
+├── data/                          # Processed results cache (gitignored, bind-mounted in Docker)
+├── README.md                      # This file
+└── logs/                          # Application logs
 ```
 
 ## Contributing
@@ -291,5 +320,6 @@ This project is part of [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) a
 - [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) - OCR toolkit
 - [PaddleOCR-VL](https://github.com/PaddlePaddle/PaddleOCR) - Vision-Language model for document parsing
 - [vLLM](https://github.com/vllm-project/vllm) - High-performance LLM inference
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) - GGUF inference (llama-server)
 - [Streamlit](https://streamlit.io/) - Web application framework
 - [PyMuPDF](https://pymupdf.readthedocs.io/) - PDF preview and processing

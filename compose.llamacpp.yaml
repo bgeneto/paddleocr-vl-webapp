@@ -1,0 +1,147 @@
+# PaddleOCR-VL Document Parser with llama.cpp Backend
+#
+# Sibling stack to compose.yaml (vLLM). Do not run both at once:
+# they share STREAMLIT_HOST_PORT and typically the same GPU.
+#
+# VLM: llama-server (CUDA) with LunarOilRig Q4_K_M decoder + Q8_0 mmproj.
+# Pipeline: paddlex llama-cpp-server client (PaddleOCR >= 3.5).
+#
+# Requirements:
+# - Docker >= 19.03
+# - NVIDIA GPU + NVIDIA Container Toolkit
+# - First start needs network to download ~900 MB of GGUF files
+#
+# Usage:
+#   docker compose -f compose.llamacpp.yaml up -d
+#   docker compose -f compose.llamacpp.yaml logs -f paddleocr-vlm-server
+#   # Access the app at http://localhost:${STREAMLIT_HOST_PORT:-8501}
+
+name: paddleocr-vl-llamacpp
+
+services:
+  streamlit-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paddleocr-vl-streamlit-llamacpp
+    ports:
+      - "${STREAMLIT_HOST_PORT:-8501}:8501"
+    environment:
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+      - STREAMLIT_THEME_BASE=light
+      - DATA_DIR=${DATA_DIR:-/app/data}
+      - PADDLEOCR_VL_API_URL=http://paddleocr-vl-api:8080/layout-parsing
+      - API_TIMEOUT=${API_TIMEOUT:-300}
+      - APP_TITLE=${APP_TITLE:-PaddleOCR-VL Document Parser}
+      - APP_DESCRIPTION=Upload PDF or image files to convert them to Markdown using PaddleOCR-VL with llama.cpp (Q4 decoder + Q8 mmproj)
+      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-99}
+      - MAX_PDF_PAGES=${MAX_PDF_PAGES:-250}
+      # llama.cpp-only throughput (do not reuse vLLM MAX_PARALLEL_PAGES / PAGES_PER_CHUNK)
+      - MAX_PARALLEL_PAGES=${LLAMA_MAX_PARALLEL_PAGES:-4}
+      - MAX_PREVIEW_PAGES=${MAX_PREVIEW_PAGES:-10}
+      - PAGES_PER_CHUNK=${LLAMA_PAGES_PER_CHUNK:-8}
+      - USE_DOC_ORIENTATION_CLASSIFY=${USE_DOC_ORIENTATION_CLASSIFY:-false}
+      - USE_DOC_UNWARPING=${USE_DOC_UNWARPING:-false}
+      - USE_LAYOUT_DETECTION=${USE_LAYOUT_DETECTION:-true}
+      - USE_CHART_RECOGNITION=${USE_CHART_RECOGNITION:-false}
+      - PRETTIFY_MARKDOWN=${PRETTIFY_MARKDOWN:-true}
+      - VISUALIZE_RESULTS=${VISUALIZE_RESULTS:-false}
+    volumes:
+      - ./app.py:/app/app.py:ro
+      - ./logs:/app/logs
+      - ./data:/app/data
+    depends_on:
+      paddleocr-vl-api:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test:
+        ["CMD-SHELL", "curl -f http://localhost:8501/_stcore/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - ocr-network
+
+  paddleocr-vl-api:
+    image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl:${API_IMAGE_TAG_SUFFIX:-latest-offline}
+    container_name: paddleocr-vl-api-llamacpp
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_DEVICE_ID:-1}"]
+              capabilities: [gpu]
+    user: root
+    restart: unless-stopped
+    environment:
+      - LLAMA_N_PARALLEL=${LLAMA_N_PARALLEL:-8}
+    volumes:
+      - ./pipeline_config_llamacpp.yaml:/home/paddleocr/pipeline_config.yaml:ro
+    command:
+      - /bin/bash
+      - -c
+      - |
+        sed "s/max_concurrency: [0-9][0-9]*/max_concurrency: $${LLAMA_N_PARALLEL}/" \
+          /home/paddleocr/pipeline_config.yaml > /tmp/pipeline_config.yaml
+        paddlex --serve --pipeline /tmp/pipeline_config.yaml
+    depends_on:
+      paddleocr-vlm-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - ocr-network
+
+  # llama-server: Q4_K_M decoder + Q8_0 vision projector (OpenAI-compatible /v1)
+  paddleocr-vlm-server:
+    image: ${LLAMA_CPP_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda}
+    container_name: paddleocr-llama-server
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_DEVICE_ID:-1}"]
+              capabilities: [gpu]
+    restart: unless-stopped
+    environment:
+      LLAMA_ARG_HOST: "0.0.0.0"
+      LLAMA_ARG_PORT: "8080"
+      LLAMA_ARG_HF_REPO: ${LLAMA_HF_REPO:-LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4}
+      LLAMA_ARG_HF_FILE: ${LLAMA_HF_FILE:-PaddleOCR-VL-1.6-Q4_K_M.gguf}
+      # Explicit URL so mmproj is not left to HF auto-attach
+      LLAMA_ARG_MMPROJ_URL: ${LLAMA_MMPROJ_URL:-https://huggingface.co/LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4/resolve/main/mmproj-Q8_0.gguf}
+      LLAMA_ARG_N_GPU_LAYERS: ${LLAMA_N_GPU_LAYERS:-99}
+      LLAMA_ARG_TEMP: "0"
+      LLAMA_ARG_JINJA: "1"
+      LLAMA_ARG_CTX_SIZE: ${LLAMA_CTX_SIZE:-8192}
+      LLAMA_ARG_N_PARALLEL: ${LLAMA_N_PARALLEL:-8}
+      LLAMA_ARG_FLASH_ATTN: on
+    volumes:
+      - llama-cpp-cache:/root/.cache/llama.cpp
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 300s
+    networks:
+      - ocr-network
+
+volumes:
+  llama-cpp-cache:
+    driver: local
+
+networks:
+  ocr-network:
+    driver: bridge
