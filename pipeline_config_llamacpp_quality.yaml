@@ -70,7 +70,8 @@ SubPipelines:
     pipeline_name: doc_preprocessor
     batch_size: 8
     use_doc_orientation_classify: True
-    use_doc_unwarping: True
+    # Off: UVDoc unwarping produces crops that 500 llama.cpp (peg-native).
+    use_doc_unwarping: False
     SubModules:
       DocOrientationClassify:
         module_name: doc_text_orientation

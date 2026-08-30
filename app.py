@@ -1174,9 +1174,9 @@ def display_processing_options() -> dict:
         ),
         "use_doc_unwarping": st.sidebar.checkbox(
             "Document Unwarping",
-            value=True if OCR_QUALITY_FIRST else USE_DOC_UNWARPING,
-            key=f"opt_unwarp_{mode_key}",
-            help="Correct curved or warped document images",
+            value=USE_DOC_UNWARPING,
+            key=f"opt_unwarp_{mode_key}_off",
+            help="Correct curved or warped document images. Off by default in quality-first too — UVDoc unwarping can 500 the llama.cpp VLM.",
         ),
         "use_layout_detection": st.sidebar.checkbox(
             "Layout Detection",

@@ -138,7 +138,7 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 |----------|---------|-------------|
 | `OCR_QUALITY_FIRST` | false | Master switch. `false` keeps the speed-first pipeline. `true` loads extra detectors, high-recall layout, figure/seal OCR, and cross-page reconstruction. On the llama.cpp stack it also switches KV cache from `q4_0` to `q8_0`. Recreate API, Streamlit, and `paddleocr-vlm-server` after changing it. |
 | `USE_DOC_ORIENTATION_CLASSIFY` | false | Auto-detect document orientation (sidebar default; quality-first defaults this on) |
-| `USE_DOC_UNWARPING` | false | Correct curved/distorted documents |
+| `USE_DOC_UNWARPING` | false | Correct curved/distorted documents. Stays **off** in quality-first (UVDoc unwarping 500s the llama.cpp VLM). |
 | `USE_LAYOUT_DETECTION` | true | Enable layout structure detection |
 | `USE_CHART_RECOGNITION` | false | Enable chart/diagram recognition |
 | `PRETTIFY_MARKDOWN` | true | Format markdown for readability |
