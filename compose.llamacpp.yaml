@@ -9,7 +9,7 @@
 # Requirements:
 # - Docker >= 19.03
 # - NVIDIA GPU + NVIDIA Container Toolkit
-# - First start needs network to download ~900 MB of GGUF files
+# - First start needs network to download ~900 MB of GGUF files into ./models/llamacpp
 #
 # Usage:
 #   docker compose -f compose.llamacpp.yaml up -d
@@ -117,18 +117,26 @@ services:
     environment:
       LLAMA_ARG_HOST: "0.0.0.0"
       LLAMA_ARG_PORT: "8080"
-      LLAMA_ARG_HF_REPO: ${LLAMA_HF_REPO:-LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4}
-      LLAMA_ARG_HF_FILE: ${LLAMA_HF_FILE:-PaddleOCR-VL-1.6-Q4_K_M.gguf}
-      # Explicit URL so mmproj is not left to HF auto-attach
-      LLAMA_ARG_MMPROJ_URL: ${LLAMA_MMPROJ_URL:-https://huggingface.co/LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4/resolve/main/mmproj-Q8_0.gguf}
+      LLAMA_ARG_MODEL: /models/PaddleOCR-VL-1.6-Q4_K_M.gguf
+      LLAMA_ARG_MMPROJ: /models/mmproj-Q8_0.gguf
+      # Used only by llama-server-entrypoint.sh on first start (not passed as --hf-*)
+      LLAMA_HF_REPO: ${LLAMA_HF_REPO:-LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4}
+      LLAMA_HF_FILE: ${LLAMA_HF_FILE:-PaddleOCR-VL-1.6-Q4_K_M.gguf}
+      LLAMA_MMPROJ_URL: ${LLAMA_MMPROJ_URL:-https://huggingface.co/LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4/resolve/main/mmproj-Q8_0.gguf}
+      HF_TOKEN: ${HF_TOKEN:-}
       LLAMA_ARG_N_GPU_LAYERS: ${LLAMA_N_GPU_LAYERS:-99}
       LLAMA_ARG_TEMP: "0"
       LLAMA_ARG_JINJA: "1"
-      LLAMA_ARG_CTX_SIZE: ${LLAMA_CTX_SIZE:-8192}
+      # Per-slot target; entrypoint sets LLAMA_ARG_CTX_SIZE = min(CTX_SIZE * N_PARALLEL, CTX_MAX)
+      LLAMA_CTX_SIZE: ${LLAMA_CTX_SIZE:-8192}
+      LLAMA_CTX_MAX: ${LLAMA_CTX_MAX:-131072}
       LLAMA_ARG_N_PARALLEL: ${LLAMA_N_PARALLEL:-8}
       LLAMA_ARG_FLASH_ATTN: on
     volumes:
+      - ./models/llamacpp:/models
+      - ./llama-server-entrypoint.sh:/entrypoint.sh:ro
       - llama-cpp-cache:/root/.cache/llama.cpp
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 60s

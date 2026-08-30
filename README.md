@@ -111,7 +111,7 @@ docker compose -f compose.llamacpp.yaml up -d
 docker compose -f compose.llamacpp.yaml logs -f paddleocr-vlm-server
 ```
 
-First start downloads ~900 MB of GGUF files into a Docker volume (`llama-cpp-cache`). Later starts are offline. llama.cpp uses far less VRAM than vLLM (~1–2 GB for the VLM); the API container still needs a GPU for layout detection.
+First start downloads ~900 MB of GGUF files into `./models/llamacpp` on the host. Later starts load those files and do not hit Hugging Face. Set `HF_TOKEN` in `.env` (a [read token](https://huggingface.co/settings/tokens)) so the first download uses authenticated Hugging Face rate limits. llama.cpp uses far less VRAM than vLLM (~1–2 GB for the VLM); the API container still needs a GPU for layout detection.
 
 Throughput for this stack is **not** `MAX_PARALLEL_PAGES` / `PAGES_PER_CHUNK` (those stay conservative for vLLM). Use `LLAMA_MAX_PARALLEL_PAGES`, `LLAMA_PAGES_PER_CHUNK`, and `LLAMA_N_PARALLEL` instead.
 
@@ -147,7 +147,9 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 | `STREAMLIT_HOST_PORT` | 8501 | External port for Streamlit |
 | `API_IMAGE_TAG_SUFFIX` | latest-offline | Docker image tag |
 | `VLM_IMAGE_TAG_SUFFIX` | latest-offline | VLM image tag (vLLM/FastDeploy stack) |
-| `LLAMA_CTX_SIZE` | 8192 | llama.cpp context size (`compose.llamacpp.yaml`) |
+| `HF_TOKEN` | (empty) | Hugging Face token for faster/authenticated GGUF downloads |
+| `LLAMA_CTX_SIZE` | 8192 | Desired tokens **per llama-server slot**; total `n_ctx` is `min(CTX_SIZE × N_PARALLEL, CTX_MAX)` |
+| `LLAMA_CTX_MAX` | 131072 | Cap on total llama-server `--ctx-size` |
 | `LLAMA_MAX_PARALLEL_PAGES` | 4 | Streamlit concurrent API workers for the llama.cpp stack |
 | `LLAMA_PAGES_PER_CHUNK` | 8 | Pages per API request on the llama.cpp stack |
 | `LLAMA_N_PARALLEL` | 8 | llama-server slots and paddlex VLM `max_concurrency` |
