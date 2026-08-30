@@ -4,12 +4,12 @@
 # start (HF hub cache is not persisted; etag mismatches delete and re-download).
 set -eu
 
-MODEL="${LLAMA_ARG_MODEL:-/models/PaddleOCR-VL-1.6-Q4_K_M.gguf}"
-MMPROJ="${LLAMA_ARG_MMPROJ:-/models/mmproj-Q8_0.gguf}"
-REPO="${LLAMA_HF_REPO:-LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4}"
-FILE="${LLAMA_HF_FILE:-PaddleOCR-VL-1.6-Q4_K_M.gguf}"
+MODEL="${LLAMA_ARG_MODEL:-/models/PaddleOCR-VL-1.6.Q8_0.gguf}"
+MMPROJ="${LLAMA_ARG_MMPROJ:-/models/PaddleOCR-VL-1.6-GGUF-mmproj.gguf}"
+REPO="${LLAMA_HF_REPO:-mradermacher/PaddleOCR-VL-1.6-GGUF}"
+FILE="${LLAMA_HF_FILE:-PaddleOCR-VL-1.6.Q8_0.gguf}"
 MODEL_URL="${LLAMA_MODEL_URL:-https://huggingface.co/${REPO}/resolve/main/${FILE}}"
-MMPROJ_URL="${LLAMA_MMPROJ_URL:-https://huggingface.co/LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4/resolve/main/mmproj-Q8_0.gguf}"
+MMPROJ_URL="${LLAMA_MMPROJ_URL:-https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6-GGUF/resolve/main/PaddleOCR-VL-1.6-GGUF-mmproj.gguf}"
 
 download() {
     dest=$1
@@ -31,10 +31,12 @@ download() {
     mv "${dest}.part" "$dest"
 }
 
-# Reuse mmproj already pulled into the old llama.cpp cache volume, if present.
-if [ ! -s "$MMPROJ" ] && [ -s /root/.cache/llama.cpp/mmproj-Q8_0.gguf ]; then
+# Reuse official mmproj already pulled into the llama.cpp cache volume, if present.
+# Do not copy the old LunarOilRig mmproj-Q8_0.gguf — it is a different projector.
+CACHED_MMPROJ="/root/.cache/llama.cpp/PaddleOCR-VL-1.6-GGUF-mmproj.gguf"
+if [ ! -s "$MMPROJ" ] && [ -s "$CACHED_MMPROJ" ]; then
     echo "Copying mmproj from llama.cpp cache volume"
-    cp /root/.cache/llama.cpp/mmproj-Q8_0.gguf "$MMPROJ"
+    cp "$CACHED_MMPROJ" "$MMPROJ"
 fi
 
 download "$MODEL" "$MODEL_URL"

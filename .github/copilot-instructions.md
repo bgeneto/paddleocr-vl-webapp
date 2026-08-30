@@ -10,7 +10,7 @@ Streamlit UI (app.py:8501) → PaddleOCR-VL API (:8080) → llama.cpp llama-serv
 
 - **Frontend**: Single-file Streamlit app (`app.py`) - handles file upload, preview, and results display
 - **API Service**: PaddleX container with PP-DocLayoutV2 for layout detection and markdown generation
-- **VLM Backend (default)**: llama.cpp (`compose.yaml`) serving PaddleOCR-VL GGUF (Q4 decoder + Q8 mmproj)
+- **VLM Backend (default)**: llama.cpp (`compose.yaml`) serving PaddleOCR-VL GGUF (Q8 decoder + official mmproj)
 - **VLM Backend (optional)**: vLLM or FastDeploy via `docker compose -f compose.vllm.yaml`
 
 ## Key Code Patterns

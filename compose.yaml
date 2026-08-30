@@ -3,13 +3,13 @@
 # Default stack: `docker compose up -d`. vLLM is compose.vllm.yaml (-f).
 # Do not run both at once: they share STREAMLIT_HOST_PORT and typically the same GPU.
 #
-# VLM: llama-server (CUDA) with LunarOilRig Q4_K_M decoder + Q8_0 mmproj.
+# VLM: llama-server (CUDA) with mradermacher Q8_0 decoder + official PaddlePaddle mmproj.
 # Pipeline: paddlex llama-cpp-server client (PaddleOCR >= 3.5).
 #
 # Requirements:
 # - Docker >= 19.03
 # - NVIDIA GPU + NVIDIA Container Toolkit
-# - First start needs network to download ~900 MB of GGUF files into ./models/llamacpp
+# - First start needs network to download ~1.4 GB of GGUF files into ./models/llamacpp
 #
 # Usage:
 #   docker compose up -d
@@ -36,7 +36,7 @@ services:
       - PADDLEOCR_VL_API_URL=http://paddleocr-vl-api:8080/layout-parsing
       - API_TIMEOUT=${API_TIMEOUT:-300}
       - APP_TITLE=${APP_TITLE:-PaddleOCR-VL Document Parser}
-      - APP_DESCRIPTION=Upload PDF or image files to convert them to Markdown using PaddleOCR-VL with llama.cpp (Q4 decoder + Q8 mmproj)
+      - APP_DESCRIPTION=Upload PDF or image files to convert them to Markdown using PaddleOCR-VL with llama.cpp (Q8 decoder + official mmproj)
       - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-99}
       - MAX_PDF_PAGES=${MAX_PDF_PAGES:-250}
       # llama.cpp-only throughput (do not reuse vLLM MAX_PARALLEL_PAGES / PAGES_PER_CHUNK)
@@ -110,9 +110,11 @@ services:
     networks:
       - ocr-network
 
-  # llama-server: Q4_K_M decoder + Q8_0 vision projector (OpenAI-compatible /v1)
+  # llama-server: Q8_0 decoder + official F16 mmproj (OpenAI-compatible /v1)
+  # Pin: server-cuda-b10689 is the latest published CUDA image as of 2026-08-30
+  # (b10702 git tag exists; its GHCR image is not published yet).
   paddleocr-vlm-server:
-    image: ${LLAMA_CPP_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda}
+    image: ${LLAMA_CPP_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda-b10689}
     container_name: paddleocr-llama-server
     deploy:
       resources:
@@ -125,16 +127,19 @@ services:
     environment:
       LLAMA_ARG_HOST: "0.0.0.0"
       LLAMA_ARG_PORT: "8080"
-      LLAMA_ARG_MODEL: /models/PaddleOCR-VL-1.6-Q4_K_M.gguf
-      LLAMA_ARG_MMPROJ: /models/mmproj-Q8_0.gguf
+      LLAMA_ARG_MODEL: /models/${LLAMA_HF_FILE:-PaddleOCR-VL-1.6.Q8_0.gguf}
+      LLAMA_ARG_MMPROJ: /models/${LLAMA_MMPROJ_FILE:-PaddleOCR-VL-1.6-GGUF-mmproj.gguf}
       # Used only by llama-server-entrypoint.sh on first start (not passed as --hf-*)
-      LLAMA_HF_REPO: ${LLAMA_HF_REPO:-LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4}
-      LLAMA_HF_FILE: ${LLAMA_HF_FILE:-PaddleOCR-VL-1.6-Q4_K_M.gguf}
-      LLAMA_MMPROJ_URL: ${LLAMA_MMPROJ_URL:-https://huggingface.co/LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4/resolve/main/mmproj-Q8_0.gguf}
+      LLAMA_HF_REPO: ${LLAMA_HF_REPO:-mradermacher/PaddleOCR-VL-1.6-GGUF}
+      LLAMA_HF_FILE: ${LLAMA_HF_FILE:-PaddleOCR-VL-1.6.Q8_0.gguf}
+      LLAMA_MMPROJ_URL: ${LLAMA_MMPROJ_URL:-https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6-GGUF/resolve/main/PaddleOCR-VL-1.6-GGUF-mmproj.gguf}
       HF_TOKEN: ${HF_TOKEN:-}
       LLAMA_ARG_N_GPU_LAYERS: ${LLAMA_N_GPU_LAYERS:-99}
       LLAMA_ARG_TEMP: "0"
       LLAMA_ARG_JINJA: "1"
+      # OCR is plain content, not tool-calls. Avoids peg-native HTTP 500s
+      # (llama.cpp #25233 UTF-8 sanitizer never merged; #27543 still open).
+      LLAMA_ARG_SKIP_CHAT_PARSING: "1"
       # Per-slot target; entrypoint sets LLAMA_ARG_CTX_SIZE = min(CTX_SIZE * N_PARALLEL, CTX_MAX)
       LLAMA_CTX_SIZE: ${LLAMA_CTX_SIZE:-8192}
       LLAMA_CTX_MAX: ${LLAMA_CTX_MAX:-131072}

@@ -1,6 +1,6 @@
 # PaddleOCR-VL Document Parser
 
-A production-ready Streamlit application that processes PDF and image files using **PaddleOCR-VL** with a **llama.cpp** backend (Q4 decoder + Q8 mmproj) for state-of-the-art document parsing and OCR. A **vLLM** stack is available via `compose.vllm.yaml`.
+A production-ready Streamlit application that processes PDF and image files using **PaddleOCR-VL** with a **llama.cpp** backend (Q8 decoder + official mmproj) for state-of-the-art document parsing and OCR. A **vLLM** stack is available via `compose.vllm.yaml`.
 
 ## Features
 
@@ -45,7 +45,7 @@ A production-ready Streamlit application that processes PDF and image files usin
 ┌─────────────────────────────────────────────────────────────────────┐
 │                   llama.cpp Inference Service                       │
 │            (paddleocr-vlm-server container - Port 8080)             │
-│  • PaddleOCR-VL-1.6 GGUF (Q4 decoder + Q8 mmproj)                   │
+│  • PaddleOCR-VL-1.6 GGUF (Q8 decoder + official mmproj)             │
 │  • GPU-accelerated VLM processing                                    │
 │  • Text, table, formula, chart recognition                          │
 └─────────────────────────────────────────────────────────────────────┘
@@ -55,7 +55,7 @@ A production-ready Streamlit application that processes PDF and image files usin
 
 ### Hardware Requirements
 - **NVIDIA GPU** + NVIDIA Container Toolkit (layout detection uses GPU on both stacks)
-- **GPU VRAM**: llama.cpp default stack typically ~1–2 GB for the VLM; 8GB+ recommended overall
+- **GPU VRAM**: llama.cpp default stack typically ~2 GB for the VLM; 8GB+ recommended overall
 - **vLLM stack** (`compose.vllm.yaml`): Compute Capability ≥ 8.0, CUDA 12.6+, 8GB+ VRAM (16GB+ preferred)
 - **System RAM**: 16GB minimum
 
@@ -90,7 +90,7 @@ docker compose logs -f
 ### 4. Access the Application
 Open your browser to `http://localhost:8501`
 
-> **Note**: First start downloads ~900 MB of GGUF files into `./models/llamacpp` on the host (set `HF_TOKEN` in `.env` for authenticated Hugging Face rate limits). Later starts reuse those files. Check logs with `docker compose logs -f paddleocr-vlm-server`.
+> **Note**: First start downloads ~1.4 GB of GGUF files into `./models/llamacpp` on the host (set `HF_TOKEN` in `.env` for authenticated Hugging Face rate limits). Later starts reuse those files. Check logs with `docker compose logs -f paddleocr-vlm-server`.
 
 ### 5. Stop the Services
 ```bash
@@ -99,7 +99,7 @@ docker compose down
 
 ## Default stack (llama.cpp)
 
-The default stack uses [llama-server](https://github.com/ggml-org/llama.cpp) with [LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4](https://huggingface.co/LunarOilRig/PaddleOCR-VL-1.6-GGUF-Q4): `PaddleOCR-VL-1.6-Q4_K_M.gguf` plus `mmproj-Q8_0.gguf`. llama.cpp uses far less VRAM than vLLM (~1–2 GB for the VLM); the API container still needs a GPU for layout detection.
+The default stack uses [llama-server](https://github.com/ggml-org/llama.cpp) pinned to `ghcr.io/ggml-org/llama.cpp:server-cuda-b10689`, with [mradermacher/PaddleOCR-VL-1.6-GGUF](https://huggingface.co/mradermacher/PaddleOCR-VL-1.6-GGUF) `PaddleOCR-VL-1.6.Q8_0.gguf` and the official [PaddlePaddle/PaddleOCR-VL-1.6-GGUF](https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6-GGUF) mmproj (`PaddleOCR-VL-1.6-GGUF-mmproj.gguf`). llama.cpp uses far less VRAM than vLLM (~2 GB for the VLM); the API container still needs a GPU for layout detection.
 
 Throughput is **not** `MAX_PARALLEL_PAGES` / `PAGES_PER_CHUNK` (those stay conservative for vLLM). Use `LLAMA_MAX_PARALLEL_PAGES`, `LLAMA_PAGES_PER_CHUNK`, and `LLAMA_N_PARALLEL` instead.
 
@@ -162,6 +162,11 @@ Speed-first (`false`) is unchanged: same YAML, same request body, same cache key
 | `API_IMAGE_TAG_SUFFIX` | latest-offline | Docker image tag |
 | `VLM_IMAGE_TAG_SUFFIX` | latest-offline | VLM image tag (vLLM/FastDeploy stack) |
 | `HF_TOKEN` | (empty) | Hugging Face token for faster/authenticated GGUF downloads |
+| `LLAMA_CPP_IMAGE` | `ghcr.io/ggml-org/llama.cpp:server-cuda-b10689` | Pinned llama-server CUDA image (do not use floating `:server-cuda`) |
+| `LLAMA_HF_REPO` | `mradermacher/PaddleOCR-VL-1.6-GGUF` | Hugging Face repo for the decoder GGUF |
+| `LLAMA_HF_FILE` | `PaddleOCR-VL-1.6.Q8_0.gguf` | Decoder filename under `LLAMA_HF_REPO` |
+| `LLAMA_MMPROJ_FILE` | `PaddleOCR-VL-1.6-GGUF-mmproj.gguf` | Local mmproj filename in `./models/llamacpp` |
+| `LLAMA_MMPROJ_URL` | PaddlePaddle official mmproj | Direct download URL for the vision projector |
 | `LLAMA_CTX_SIZE` | 8192 | Desired tokens **per llama-server slot**; total `n_ctx` is `min(CTX_SIZE × N_PARALLEL, CTX_MAX)` |
 | `LLAMA_CTX_MAX` | 131072 | Cap on total llama-server `--ctx-size` |
 | `LLAMA_MAX_PARALLEL_PAGES` | 4 | Streamlit concurrent API workers for the llama.cpp stack |
@@ -308,7 +313,7 @@ docker run -p 8501:8501 \
 streamlit_ocr_app/
 ├── app.py                         # Streamlit application
 ├── Dockerfile                     # Frontend container definition
-├── compose.yaml                   # llama.cpp stack (default; Q4 decoder + Q8 mmproj)
+├── compose.yaml                   # llama.cpp stack (default; Q8 decoder + official mmproj)
 ├── compose.vllm.yaml              # vLLM stack (`docker compose -f compose.vllm.yaml`)
 ├── pipeline_config_llamacpp.yaml  # paddlex pipeline for llama-cpp-server
 ├── vllm_config.yaml               # vLLM memory/performance config
