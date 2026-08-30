@@ -1777,7 +1777,7 @@ def main():
 
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
-        st.button(
+        start_clicked = st.button(
             "🔍 Start OCR",
             type="primary",
             disabled=st.session_state.is_processing,
@@ -1786,7 +1786,7 @@ def main():
             key="start_ocr",
         )
     with col2:
-        st.button(
+        cancel_clicked = st.button(
             "⏹️ Cancel",
             type="secondary",
             disabled=not st.session_state.is_processing,
@@ -1809,6 +1809,14 @@ def main():
                     st.caption(f"Processing {name}…")
         else:
             st.caption(f"Ready to process {len(valid_files)} document(s)")
+
+    # on_click runs in a live app; the return value covers AppTest and
+    # any runner that skips callbacks.
+    if start_clicked:
+        st.session_state.is_processing = True
+        st.session_state.start_ocr_requested = True
+    if cancel_clicked:
+        _on_cancel_ocr()
 
     if st.session_state.start_ocr_requested:
         st.session_state.start_ocr_requested = False
