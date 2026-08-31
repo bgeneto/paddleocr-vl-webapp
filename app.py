@@ -42,7 +42,9 @@ MAX_PARALLEL_PAGES = int(os.getenv("MAX_PARALLEL_PAGES", "8"))
 MAX_PREVIEW_PAGES = int(os.getenv("MAX_PREVIEW_PAGES", "10"))  # Limit preview rendering
 # Pages per chunk - HIGHER = better GPU batching (vLLM processes all pages in chunk together)
 # This is the KEY setting for GPU utilization. Increase if you have enough VRAM.
-PAGES_PER_CHUNK = int(os.getenv("PAGES_PER_CHUNK", "16"))  # Pages per API request for GPU batching
+PAGES_PER_CHUNK = int(
+    os.getenv("PAGES_PER_CHUNK", "16")
+)  # Pages per API request for GPU batching
 
 # PaddleOCR-VL API Configuration
 PADDLEOCR_VL_API_URL = os.getenv(
@@ -367,7 +369,9 @@ def save_result_to_disk(
             "display_name": display_name,
             "hash": hash_str,
             "fingerprint": fingerprint,
-            "options": {key: bool(options.get(key)) for key, _ in _OPTION_FINGERPRINT_KEYS},
+            "options": {
+                key: bool(options.get(key)) for key, _ in _OPTION_FINGERPRINT_KEYS
+            },
             "page_count": page_count,
             "status": "complete",
             "created_at": created_at,
@@ -424,7 +428,9 @@ def load_cached_result(hash_str: str, fingerprint: str) -> dict | None:
             for name in names:
                 if name.startswith(images_prefix) and not name.endswith("/"):
                     data = zf.read(name)
-                    images[name[len(images_prefix):]] = base64.b64encode(data).decode("ascii")
+                    images[name[len(images_prefix) :]] = base64.b64encode(data).decode(
+                        "ascii"
+                    )
 
         return {
             "markdown": markdown_text,
@@ -522,7 +528,9 @@ def write_partial_meta(
             "display_name": display_name,
             "hash": hash_str,
             "fingerprint": fingerprint,
-            "options": {key: bool(options.get(key)) for key, _ in _OPTION_FINGERPRINT_KEYS},
+            "options": {
+                key: bool(options.get(key)) for key, _ in _OPTION_FINGERPRINT_KEYS
+            },
             "page_count": page_count,
             "status": "partial",
             "created_at": created_at,
@@ -555,6 +563,7 @@ class OcrJob:
         self.status = "running"  # running | cancelling | done | cancelled | error
         self.current_file = ""
         self.progress = (0, 0)
+        self.detail = ""
         self.results: dict[str, dict] = {}
         self.messages: list[tuple[str, str]] = []
         self.error: str | None = None
@@ -569,9 +578,11 @@ class OcrJob:
         with self._lock:
             self.current_file = name
 
-    def set_progress(self, current: int, total: int) -> None:
+    def set_progress(self, current: int, total: int, detail: str | None = None) -> None:
         with self._lock:
-            self.progress = (current, total)
+            self.progress = (int(current), int(total))
+            if detail is not None:
+                self.detail = detail
 
     def add_message(self, level: str, text: str) -> None:
         with self._lock:
@@ -593,6 +604,7 @@ class OcrJob:
                 "status": self.status,
                 "current_file": self.current_file,
                 "progress": self.progress,
+                "detail": self.detail,
                 "results": dict(self.results),
                 "messages": list(self.messages),
                 "error": self.error,
@@ -995,6 +1007,117 @@ def process_document(
     return response.json()
 
 
+# llama.cpp / vLLM Prometheus counters (any one present is enough).
+_VLM_METRIC_NAMES = (
+    "llamacpp:tokens_predicted",
+    "llamacpp_tokens_predicted",
+    "llamacpp:n_tokens_predicted",
+    "llamacpp:predicted_tokens_total",
+    "vllm:generation_tokens_total",
+)
+_VLM_PROMPT_METRIC_NAMES = (
+    "llamacpp:tokens_evaluated",
+    "llamacpp_tokens_evaluated",
+    "llamacpp:prompt_tokens_total",
+    "vllm:prompt_tokens_total",
+)
+# Decode tokens per PDF page (crops vary; this only paces the bar, not billing).
+_VLM_TOKENS_PER_PAGE = 160.0
+_VLM_METRICS_URL = (
+    os.getenv("LLAMA_SERVER_URL", "http://paddleocr-vlm-server:8080").rstrip("/")
+    + "/metrics"
+)
+
+
+def _prometheus_counter(text: str, names: tuple[str, ...]) -> float | None:
+    """Return the first matching Prometheus counter value, or None."""
+    for raw in text.splitlines():
+        if not raw or raw.startswith("#"):
+            continue
+        for name in names:
+            if raw.startswith(name + " ") or raw.startswith(name + "{"):
+                try:
+                    return float(raw.rsplit(None, 1)[-1])
+                except ValueError:
+                    return None
+    return None
+
+
+def _vlm_work_units() -> float | None:
+    """Monotonic VLM work counter from llama.cpp/vLLM /metrics, if reachable."""
+    try:
+        response = requests.get(_VLM_METRICS_URL, timeout=0.35)
+        if response.status_code != 200:
+            return None
+        body = response.text
+        predicted = _prometheus_counter(body, _VLM_METRIC_NAMES)
+        prompt = _prometheus_counter(body, _VLM_PROMPT_METRIC_NAMES)
+        if predicted is None and prompt is None:
+            return None
+        return (predicted or 0.0) + (prompt or 0.0) / 8.0
+    except requests.RequestException:
+        return None
+
+
+def _page_range_label(page_indices: list[int], total_pages: int) -> str:
+    first = page_indices[0] + 1
+    last = page_indices[-1] + 1
+    if first == last:
+        return f"page {first} of {total_pages}"
+    return f"pages {first}–{last} of {total_pages}"
+
+
+class _ChunkProgress:
+    """Thread-safe page progress across parallel in-flight API chunks."""
+
+    def __init__(self, committed: int, total: int, callback) -> None:
+        self._lock = threading.Lock()
+        self.committed = committed
+        self.total = total
+        self.soft: dict[int, int] = {}
+        self.labels: dict[int, str] = {}
+        self.callback = callback
+
+    def _emit(self) -> None:
+        extra = sum(self.soft.values())
+        current = min(self.total, self.committed + extra)
+        labels = [self.labels[k] for k in sorted(self.labels)]
+        if labels:
+            detail = "OCR " + "; ".join(labels)
+        elif self.committed >= self.total and self.total:
+            detail = ""
+        else:
+            detail = f"{current}/{self.total} pages"
+        if self.callback:
+            self.callback(current, self.total, detail)
+
+    def begin_chunk(self, idx: int, n_pages: int, label: str) -> None:
+        with self._lock:
+            self.soft[idx] = 0
+            self.labels[idx] = label
+            self._emit()
+
+    def set_soft(self, idx: int, extra: int, label: str | None = None) -> None:
+        with self._lock:
+            self.soft[idx] = extra
+            if label is not None:
+                self.labels[idx] = label
+            self._emit()
+
+    def finish_chunk(self, idx: int, n_pages: int) -> None:
+        with self._lock:
+            self.soft.pop(idx, None)
+            self.labels.pop(idx, None)
+            self.committed += n_pages
+            self._emit()
+
+    def abandon_chunk(self, idx: int) -> None:
+        with self._lock:
+            self.soft.pop(idx, None)
+            self.labels.pop(idx, None)
+            self._emit()
+
+
 def process_chunk(args: tuple) -> tuple[int, list[int], list | None, str | None]:
     """
     Process a chunk of PDF pages. Helper function for parallel chunk processing.
@@ -1006,9 +1129,9 @@ def process_chunk(args: tuple) -> tuple[int, list[int], list | None, str | None]
 
     Args:
         args: Tuple of (chunk_index, page_indices, chunk_content, filename,
-            options, cancel_event, file_hash, fingerprint). page_indices are
-            0-indexed original PDF page numbers, in the same order as pages
-            in chunk_content.
+            options, cancel_event, file_hash, fingerprint, tracker, total_pages).
+            page_indices are 0-indexed original PDF page numbers, in the same
+            order as pages in chunk_content.
 
     Returns:
         Tuple of (chunk_index, page_indices, parsing_results_list, error_message)
@@ -1022,24 +1145,78 @@ def process_chunk(args: tuple) -> tuple[int, list[int], list | None, str | None]
         cancel_event,
         file_hash,
         fingerprint,
+        tracker,
+        total_pages,
     ) = args
+
+    n_pages = len(page_indices)
+    label = _page_range_label(page_indices, total_pages)
 
     # Check for cancellation before starting
     if cancel_event and cancel_event.is_set():
         return (chunk_index, page_indices, None, "Cancelled")
 
+    if tracker is not None:
+        tracker.begin_chunk(chunk_index, n_pages, f"{label} (starting)")
+
+    box: dict = {}
+
+    def _post() -> None:
+        try:
+            box["response"] = process_document(
+                file_content=chunk_content,
+                filename=filename,
+                **_layout_api_options(options),
+            )
+        except Exception as exc:
+            box["error"] = exc
+
+    worker = threading.Thread(
+        target=_post, name=f"ocr-chunk-{chunk_index}", daemon=True
+    )
+    worker.start()
+    t0 = time.perf_counter()
+    units0 = _vlm_work_units()
+    last_extra = 0
+
+    while worker.is_alive():
+        worker.join(0.35)
+        if tracker is None:
+            continue
+        elapsed = time.perf_counter() - t0
+        units = _vlm_work_units()
+        extra = last_extra
+        phase = "layout"
+        if units0 is not None and units is not None:
+            delta = max(0.0, units - units0)
+            if delta >= 8:
+                phase = "recognize"
+                extra = min(n_pages - 1, int(delta / _VLM_TOKENS_PER_PAGE))
+        elif n_pages > 1:
+            extra = min(n_pages - 1, int(elapsed / 0.5))
+        extra = max(last_extra, extra)
+        last_extra = extra
+        verb = "recognizing" if phase == "recognize" else "detecting layout on"
+        tracker.set_soft(chunk_index, extra, f"{verb} {label}")
+
+    if "error" in box:
+        if tracker is not None:
+            tracker.abandon_chunk(chunk_index)
+        return (chunk_index, page_indices, None, str(box["error"]))
+    if "response" not in box:
+        if tracker is not None:
+            tracker.abandon_chunk(chunk_index)
+        return (chunk_index, page_indices, None, "Chunk request failed")
+
     try:
-        # Send multi-page chunk to API - vLLM will batch-process all pages together
-        chunk_response = process_document(
-            file_content=chunk_content,
-            filename=filename,
-            **_layout_api_options(options),
-        )
+        chunk_response = box["response"]
         result = chunk_response.get("result", {})
         parsing_results = result.get("layoutParsingResults", [])
 
         if not parsing_results or len(parsing_results) != len(page_indices):
             got = 0 if not parsing_results else len(parsing_results)
+            if tracker is not None:
+                tracker.abandon_chunk(chunk_index)
             return (
                 chunk_index,
                 page_indices,
@@ -1049,11 +1226,24 @@ def process_chunk(args: tuple) -> tuple[int, list[int], list | None, str | None]
 
         # Persist before returning so a dying main thread does not lose this chunk
         if file_hash and fingerprint:
-            for page_num, page_result in zip(page_indices, parsing_results):
+            for i, (page_num, page_result) in enumerate(
+                zip(page_indices, parsing_results)
+            ):
                 save_page_result(file_hash, fingerprint, page_num, page_result)
+                if tracker is not None:
+                    tracker.set_soft(
+                        chunk_index,
+                        min(n_pages - 1, i + 1),
+                        f"saving {label}",
+                    )
+
+        if tracker is not None:
+            tracker.finish_chunk(chunk_index, n_pages)
 
         return (chunk_index, page_indices, parsing_results, None)
     except Exception as e:
+        if tracker is not None:
+            tracker.abandon_chunk(chunk_index)
         return (chunk_index, page_indices, None, str(e))
 
 
@@ -1082,7 +1272,7 @@ def process_pdf_in_batches(
     Args:
         file_content: Raw bytes of the PDF file
         filename: Original filename
-        progress_callback: Optional callback function(completed_pages, total_pages)
+        progress_callback: Optional callback(completed_pages, total_pages, detail=None)
         cancel_event: Optional threading.Event to signal cancellation
         max_workers: Maximum parallel chunk workers (default: MAX_PARALLEL_PAGES)
         pages_per_chunk: Pages per chunk for GPU batching (default: PAGES_PER_CHUNK)
@@ -1122,6 +1312,8 @@ def process_pdf_in_batches(
     if progress_callback:
         progress_callback(len(results_dict), total_pages)
 
+    tracker = _ChunkProgress(len(results_dict), total_pages, progress_callback)
+
     if not missing_pages:
         all_parsing_results = restructure_parsing_results(
             [results_dict[p] for p in range(total_pages)],
@@ -1135,9 +1327,7 @@ def process_pdf_in_batches(
         }
 
     if file_hash and fingerprint:
-        write_partial_meta(
-            file_hash, fingerprint, filename, total_pages, options
-        )
+        write_partial_meta(file_hash, fingerprint, filename, total_pages, options)
 
     # Evenly distribute remaining pages across chunks (same idea as a full run)
     n_missing = len(missing_pages)
@@ -1160,6 +1350,8 @@ def process_pdf_in_batches(
                 cancel_event,
                 file_hash,
                 fingerprint,
+                tracker,
+                total_pages,
             )
         )
 
@@ -1192,9 +1384,6 @@ def process_pdf_in_batches(
             elif parsing_results:
                 for page_num, page_result in zip(page_indices, parsing_results):
                     results_dict[page_num] = page_result
-
-            if progress_callback:
-                progress_callback(len(results_dict), total_pages)
 
     if cancelled:
         raise CancellationError(
@@ -1233,9 +1422,7 @@ def process_pdf_in_batches(
 #   - a bare currency `$` (must be `\$` or KaTeX treats it as math)
 # Normalize once at extract/load so preview, .md download, and ZIP stay in sync.
 _CODE_SEGMENT = re.compile(r"(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]+`)")
-_MATH_HINT = re.compile(
-    r"\\[a-zA-Z]+|[_^{}]|[=<>≤≥±∞∑∫√≠≈·×÷]|[+\-*/]"
-)
+_MATH_HINT = re.compile(r"\\[a-zA-Z]+|[_^{}]|[=<>≤≥±∞∑∫√≠≈·×÷]|[+\-*/]")
 _MATH_IDENT = re.compile(r"^[A-Za-z]\d{0,3}(\([^()]{0,24}\))?$")
 _MATH_NUMBER = re.compile(r"^[0-9]+(\.[0-9]+)?$")
 
@@ -1466,9 +1653,14 @@ def _render_ocr_job_progress(snapshot: dict) -> None:
         )
     name = snapshot["current_file"] or "document"
     current, total = snapshot["progress"]
+    detail = (snapshot.get("detail") or "").strip()
     if total:
         ratio = min(1.0, max(0.0, current / total if total else 0.0))
-        st.progress(ratio, text=f"{name}: page {current}/{total}...")
+        if detail:
+            text = f"{name}: {current}/{total} · {detail}"
+        else:
+            text = f"{name}: page {current}/{total}..."
+        st.progress(ratio, text=text)
     else:
         st.caption(f"Working on {name}…")
 
@@ -1491,7 +1683,7 @@ def _poll_ocr_job_until_idle() -> None:
     """Refresh progress without blocking the script on OCR (keeps Cancel live)."""
     fragment = getattr(st, "fragment", None)
     if fragment is not None:
-        fragment(run_every=0.6)(_ocr_job_poll_tick)()
+        fragment(run_every=0.4)(_ocr_job_poll_tick)()
         return
 
     _ocr_job_poll_tick()
@@ -1709,9 +1901,7 @@ def _run_ocr_job(
                 continue
             except Exception as e:
                 logger.exception("OCR failed for %s", spec["name"])
-                job.add_message(
-                    "error", f"{spec['name']}: unexpected error: {e}"
-                )
+                job.add_message("error", f"{spec['name']}: unexpected error: {e}")
                 continue
 
         if job.cancel_event.is_set():
@@ -1791,9 +1981,7 @@ def display_ocr_file_output(
 
         with col2:
             if images:
-                zip_data = create_download_zip(
-                    markdown_text, images, base_filename
-                )
+                zip_data = create_download_zip(markdown_text, images, base_filename)
                 st.download_button(
                     label="📦 Download ZIP (with images)",
                     data=zip_data,
@@ -2032,8 +2220,12 @@ def main():
             else:
                 name = snap["current_file"] or "document"
                 current, total = snap["progress"]
+                detail = (snap.get("detail") or "").strip()
                 if total:
-                    st.caption(f"Processing {name} ({current}/{total})")
+                    caption = f"Processing {name} ({current}/{total})"
+                    if detail:
+                        caption = f"{caption} — {detail}"
+                    st.caption(caption)
                 else:
                     st.caption(f"Processing {name}…")
         else:

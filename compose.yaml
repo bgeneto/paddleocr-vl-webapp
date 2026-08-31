@@ -35,6 +35,7 @@ services:
       - DATA_DIR=${DATA_DIR:-/app/data}
       - DATA_CACHE_RETENTION_DAYS=${DATA_CACHE_RETENTION_DAYS:-45}
       - PADDLEOCR_VL_API_URL=http://paddleocr-vl-api:8080/layout-parsing
+      - LLAMA_SERVER_URL=http://paddleocr-vlm-server:8080
       - API_TIMEOUT=${API_TIMEOUT:-300}
       - APP_TITLE=${APP_TITLE:-PaddleOCR-VL Document Parser}
       - APP_DESCRIPTION=Upload PDF or image files to convert them to Markdown using PaddleOCR-VL with llama.cpp (Q8 decoder + official mmproj)
@@ -161,6 +162,7 @@ services:
     command:
       - --sleep-idle-seconds
       - "${LLAMA_SLEEP_IDLE_SECONDS:-30}"
+      - --metrics
     volumes:
       - ./models/llamacpp:/models
       - ./llama-server-entrypoint.sh:/entrypoint.sh:ro

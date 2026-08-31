@@ -37,6 +37,7 @@ services:
       - DATA_CACHE_RETENTION_DAYS=${DATA_CACHE_RETENTION_DAYS:-45}
       # API Configuration
       - PADDLEOCR_VL_API_URL=http://paddleocr-vl-api:8080/layout-parsing
+      - LLAMA_SERVER_URL=http://paddleocr-vlm-server:8080
       - API_TIMEOUT=${API_TIMEOUT:-300}
       # App Configuration
       - APP_TITLE=${APP_TITLE:-PaddleOCR-VL Document Parser}
