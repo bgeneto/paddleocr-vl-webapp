@@ -133,6 +133,8 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 | `MAX_PDF_PAGES` | 250 | Maximum PDF pages to process |
 | `API_TIMEOUT` | 300 | API request timeout in seconds |
 | `DATA_CACHE_RETENTION_DAYS` | 45 | Auto-delete cached `data/` entries older than this many days (`0` disables) |
+| `APP_UID` | 1000 | Numeric uid for the Streamlit container (`id -u` on the host). Must own `./data` and `./logs`. |
+| `APP_GID` | 1000 | Numeric gid for the Streamlit container (`id -g` on the host). |
 
 ### Processing Options
 | Variable | Default | Description |
@@ -194,7 +196,8 @@ data/
         └── result.zip             # {stem}.md + {stem}_images/... (same layout as the download button)
 ```
 
-- **Instant re-uploads**: re-uploading a byte-identical file (matched by SHA-256) with the same sidebar options serves the stored result instantly — no API call.
+- **Instant re-uploads**: re-uploading a byte-identical file (matched by SHA-256) with the same sidebar options serves the stored result instantly — no API call. The UI shows an **⚡ cached** badge on the file.
+- **Container user**: Streamlit runs as `APP_UID`/`APP_GID` (default `1000:1000`, not root). Those values must match the owner of `./data` and `./logs`. Copy them from `id -u` / `id -g` into `.env`, then `docker compose up -d --build --force-recreate streamlit-app`.
 - **Changed options**: different sidebar options produce a different fingerprint directory, so the document is reprocessed and the new entry is stored alongside the previous ones. Partial progress from the previous options is not reused.
 - **Interrupt / resume**: PDF jobs checkpoint each completed chunk (the pages in one API request) under `pages/`. If OCR is interrupted — vLLM/API crash, timeout, cancel, browser/tab close, or container restart — click **Start OCR** again with the same file and the same options. Already-OCR'd pages are skipped; only the remaining pages are sent to the API. A chunk that was in-flight when the API died is retried as a whole (that request is atomic). Closing the browser does **not** keep the original run going in the background; it only preserves completed pages so the next Start OCR can continue.
 - **Survives restarts**: the cache lives on the host bind mount, so `docker compose down && up -d` does not lose it (including partial `pages/` checkpoints).

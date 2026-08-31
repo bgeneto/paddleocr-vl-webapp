@@ -23,6 +23,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    # Must own ./data and ./logs. Set APP_UID/APP_GID in .env to `id -u`/`id -g`.
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
     container_name: paddleocr-vl-streamlit-llamacpp
     ports:
       - "${STREAMLIT_HOST_PORT:-8501}:8501"

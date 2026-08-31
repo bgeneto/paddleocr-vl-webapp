@@ -8,6 +8,10 @@
 
 FROM python:3.11-slim
 
+# Host bind-mount owner (./data, ./logs). Override at build with APP_UID/APP_GID.
+ARG APP_UID=1000
+ARG APP_GID=1000
+
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -19,8 +23,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Create non-root user for security
-RUN useradd --create-home --shell /bin/bash appuser
+# Create non-root user matching the host uid/gid so bind-mounted ./data is writable
+RUN groupadd --gid ${APP_GID} appuser && \
+    useradd --uid ${APP_UID} --gid ${APP_GID} --create-home --shell /bin/bash appuser
 
 # Set working directory
 WORKDIR /app

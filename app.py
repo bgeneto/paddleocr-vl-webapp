@@ -86,7 +86,10 @@ SUPPORTED_EXTENSIONS = [".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp
 # (see compose.yaml). Entries older than DATA_CACHE_RETENTION_DAYS are removed
 # automatically (see schedule_cache_cleanup); this cache is not durable storage.
 DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).resolve().parent / "data")))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
 # 0 disables automatic eviction. Positive values are a maximum age in days.
 DATA_CACHE_RETENTION_DAYS = int(os.getenv("DATA_CACHE_RETENTION_DAYS", "45"))
 
@@ -148,6 +151,18 @@ def cache_dirs(hash_str: str, fingerprint: str) -> Path:
     entry_dir = DATA_DIR / hash_str / fingerprint
     entry_dir.mkdir(parents=True, exist_ok=True)
     return entry_dir
+
+
+def _dir_is_writable(path: Path) -> bool:
+    """Return True if path exists (or can be created) and a file can be written."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".write_probe"
+        probe.write_bytes(b"ok")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
 
 
 def _parse_iso_datetime(value: object) -> datetime | None:
@@ -342,12 +357,12 @@ def save_result_to_disk(
     images: dict,
     page_count: int,
     options: dict,
-) -> None:
+) -> bool:
     """Persist a successful result so re-uploads can be served instantly.
 
     Never raises: a storage failure must not break a successful in-memory
-    result (logged + surfaced as a warning instead). All files are written
-    atomically (temp file + rename).
+    result (logged; the worker surfaces a warning). All files are written
+    atomically (temp file + rename). Returns True on success, False on failure.
     """
     try:
         entry_dir = cache_dirs(hash_str, fingerprint)
@@ -385,14 +400,12 @@ def save_result_to_disk(
         _atomic_write_bytes(
             entry_dir / "meta.json", json.dumps(meta, indent=2).encode("utf-8")
         )
+        return True
     except Exception as e:
         logger.warning(
             "Failed to save result to disk cache (%s/%s): %s", hash_str, fingerprint, e
         )
-        try:
-            st.warning(f"⚠️ Could not persist result to disk cache: {e}")
-        except Exception:
-            pass
+        return False
 
 
 def load_cached_result(hash_str: str, fingerprint: str) -> dict | None:
@@ -1689,6 +1702,20 @@ def create_download_zip(markdown_text: str, images: dict, base_filename: str) ->
     return zip_buffer.getvalue()
 
 
+def _render_file_cache_banner(cached: dict) -> None:
+    """Persistent per-file cache notice (re-rendered every script run)."""
+    if cached.get("from_disk_cache"):
+        st.success(
+            "⚡ Instant from disk cache — previously processed with these options. "
+            "Change processing options to reprocess."
+        )
+    else:
+        st.info(
+            "📋 Using cached results from this session. "
+            "Change processing options to reprocess."
+        )
+
+
 def _flash_ocr_messages(messages: list[tuple[str, str]]) -> None:
     """Render worker/UI status lines with the matching Streamlit call."""
     for level, text in messages:
@@ -1904,7 +1931,7 @@ def _process_one_file_for_job(
         "success", f"{filename}: processed in {processing_time:.1f} seconds"
     )
 
-    save_result_to_disk(
+    if not save_result_to_disk(
         hash_str=file_hash,
         fingerprint=options_fp,
         display_name=filename,
@@ -1912,7 +1939,13 @@ def _process_one_file_for_job(
         images=images,
         page_count=page_count,
         options=options,
-    )
+    ):
+        job.add_message(
+            "warning",
+            f"{filename}: result was not saved to the disk cache. "
+            "Check that ./data is writable (set APP_UID/APP_GID in .env to "
+            "your `id -u`/`id -g` and recreate the Streamlit container).",
+        )
     return {
         "markdown": markdown_text,
         "images": images,
@@ -2180,6 +2213,16 @@ def main():
 
     st.success("✅ PaddleOCR-VL API service is healthy")
 
+    if not _dir_is_writable(DATA_DIR):
+        st.error(
+            f"Result cache directory `{DATA_DIR}` is not writable "
+            f"(container uid={os.getuid()} gid={os.getgid()}). "
+            "Re-uploads will not hit the disk cache. Set `APP_UID`/`APP_GID` in "
+            "`.env` to your host `id -u`/`id -g`, chown `./data` and `./logs` "
+            "to that user, and recreate Streamlit: "
+            "`docker compose up -d --build --force-recreate streamlit-app`."
+        )
+
     # Processing options
     options = display_processing_options()
     # Fingerprint of the current options; identical file + options share one cache entry
@@ -2237,14 +2280,34 @@ def main():
     if not valid_files:
         return
 
+    # Hydrate session from disk on every rerun so a re-upload with the same
+    # options shows cached results immediately (no extra Start OCR click).
+    to_process, cache_messages = _prepare_files_for_job(valid_files, options_fp)
+
     # Preview section
     st.header("👁️ Document Preview")
     st.caption("Review your documents before processing")
 
     for uploaded_file, file_content, file_hash in valid_files:
         file_key = f"{uploaded_file.name}_{uploaded_file.size}"
+        cached = st.session_state.processing_results.get(file_key)
+        cache_hit = (
+            cached is not None and cached.get("fingerprint") == options_fp
+        )
+        title = f"📄 {uploaded_file.name}"
+        if cache_hit:
+            title += "  ·  ⚡ cached"
 
-        with st.expander(f"📄 {uploaded_file.name}", expanded=True):
+        with st.expander(title, expanded=True):
+            if cache_hit:
+                _render_file_cache_banner(cached)
+            else:
+                already_done = len(load_completed_pages(file_hash, options_fp))
+                if already_done:
+                    st.info(
+                        f"♻️ {already_done} page(s) already checkpointed. "
+                        "Click Start OCR to resume."
+                    )
             display_file_preview(uploaded_file, file_content)
 
             # Store file content for later processing
@@ -2296,7 +2359,19 @@ def main():
                 else:
                     st.caption(f"Processing {name}…")
         else:
-            st.caption(f"Ready to process {len(valid_files)} document(s)")
+            cached_count = len(valid_files) - len(to_process)
+            if not to_process:
+                st.caption(
+                    f"All {len(valid_files)} document(s) are cached — "
+                    "Start OCR is not needed"
+                )
+            elif cached_count:
+                st.caption(
+                    f"Ready to process {len(to_process)} document(s) "
+                    f"({cached_count} cached)"
+                )
+            else:
+                st.caption(f"Ready to process {len(valid_files)} document(s)")
 
     # on_click runs in a live app; the return value covers AppTest and
     # any runner that skips callbacks.
@@ -2309,7 +2384,6 @@ def main():
     if st.session_state.start_ocr_requested:
         st.session_state.start_ocr_requested = False
         st.session_state.last_ocr_messages = []
-        to_process, cache_messages = _prepare_files_for_job(valid_files, options_fp)
         if not to_process:
             st.session_state.is_processing = False
             st.session_state.last_ocr_messages = cache_messages
@@ -2350,7 +2424,12 @@ def main():
         result_items.append((file_key, cached))
         markdown_text = normalize_markdown_math(cached["markdown"])
         cached["markdown"] = markdown_text
-        with st.expander(f"📄 {uploaded_file.name}", expanded=True):
+        result_title = f"📄 {uploaded_file.name}"
+        if cached.get("from_disk_cache"):
+            result_title += "  ·  ⚡ cached"
+        with st.expander(result_title, expanded=True):
+            if cached.get("from_disk_cache"):
+                _render_file_cache_banner(cached)
             display_ocr_file_output(
                 file_key,
                 cached.get("display_name", uploaded_file.name),
