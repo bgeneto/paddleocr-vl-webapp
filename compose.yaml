@@ -88,12 +88,17 @@ services:
               capabilities: [gpu]
     user: root
     restart: unless-stopped
+    init: true
     environment:
       - LLAMA_N_PARALLEL=${LLAMA_N_PARALLEL:-8}
       - OCR_QUALITY_FIRST=${OCR_QUALITY_FIRST:-false}
+      # Stop paddlex after idle so PP-DocLayoutV3 VRAM is returned to the driver.
+      # -1 keeps the old always-resident behavior. GET /health does not reset the timer.
+      - PADDLEX_SLEEP_IDLE_SECONDS=${PADDLEX_SLEEP_IDLE_SECONDS:-60}
     volumes:
       - ./pipeline_config_llamacpp.yaml:/home/paddleocr/pipeline_config_speed.yaml:ro
       - ./pipeline_config_llamacpp_quality.yaml:/home/paddleocr/pipeline_config_quality.yaml:ro
+      - ./paddlex-idle-serve.py:/home/paddleocr/paddlex-idle-serve.py:ro
     command:
       - /bin/bash
       - -c
@@ -105,11 +110,13 @@ services:
         fi
         sed "s/max_concurrency: [0-9][0-9]*/max_concurrency: $${LLAMA_N_PARALLEL}/" \
           "$$CFG" > /tmp/pipeline_config.yaml
-        paddlex --serve --pipeline /tmp/pipeline_config.yaml
+        PYTHON=$$(command -v python3 || command -v python || echo /usr/local/bin/python)
+        exec "$$PYTHON" /home/paddleocr/paddlex-idle-serve.py --pipeline /tmp/pipeline_config.yaml
     depends_on:
       paddleocr-vlm-server:
         condition: service_healthy
     healthcheck:
+      # Hits the idle proxy, not paddlex — so the probe cannot pin layout models in VRAM.
       test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
       interval: 30s
       timeout: 10s

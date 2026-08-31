@@ -99,7 +99,7 @@ docker compose down
 
 ## Default stack (llama.cpp)
 
-The default stack uses [llama-server](https://github.com/ggml-org/llama.cpp) pinned to `ghcr.io/ggml-org/llama.cpp:server-cuda-b10689`, with [mradermacher/PaddleOCR-VL-1.6-GGUF](https://huggingface.co/mradermacher/PaddleOCR-VL-1.6-GGUF) `PaddleOCR-VL-1.6.Q8_0.gguf` and the official [PaddlePaddle/PaddleOCR-VL-1.6-GGUF](https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6-GGUF) mmproj (`PaddleOCR-VL-1.6-GGUF-mmproj.gguf`). llama.cpp uses far less VRAM than vLLM (~2 GB for the VLM); the API container still needs a GPU for layout detection.
+The default stack uses [llama-server](https://github.com/ggml-org/llama.cpp) pinned to `ghcr.io/ggml-org/llama.cpp:server-cuda-b10689`, with [mradermacher/PaddleOCR-VL-1.6-GGUF](https://huggingface.co/mradermacher/PaddleOCR-VL-1.6-GGUF) `PaddleOCR-VL-1.6.Q8_0.gguf` and the official [PaddlePaddle/PaddleOCR-VL-1.6-GGUF](https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6-GGUF) mmproj (`PaddleOCR-VL-1.6-GGUF-mmproj.gguf`). llama.cpp uses far less VRAM than vLLM (~2 GB for the VLM); the API container still needs a GPU for layout detection while a job is running. After `LLAMA_SLEEP_IDLE_SECONDS` / `PADDLEX_SLEEP_IDLE_SECONDS` of idle time the VLM is unloaded and paddlex is stopped so that memory returns to the GPU.
 
 Throughput is **not** `MAX_PARALLEL_PAGES` / `PAGES_PER_CHUNK` (those stay conservative for vLLM). Use `LLAMA_MAX_PARALLEL_PAGES`, `LLAMA_PAGES_PER_CHUNK`, and `LLAMA_N_PARALLEL` instead.
 
@@ -178,6 +178,8 @@ Speed-first (`false`) is unchanged: same YAML, same request body, same cache key
 | `LLAMA_N_PARALLEL` | 8 | llama-server slots and paddlex VLM `max_concurrency` |
 | `LLAMA_UBATCH_SIZE` | 2048 | llama-server `--ubatch-size` (vision prefill). llama.cpp default is 512 |
 | `LLAMA_N_GPU_LAYERS` | 99 | Offload all decoder layers to GPU |
+| `LLAMA_SLEEP_IDLE_SECONDS` | 60 | Unload the llama-server VLM from VRAM after this many idle seconds (`-1` disables) |
+| `PADDLEX_SLEEP_IDLE_SECONDS` | 60 | Stop paddlex after idle so layout-detection VRAM is released (`0` = as soon as the last request finishes, `-1` disables). Recreate `paddleocr-vl-api` after changing. |
 
 ## Persistence & Caching
 

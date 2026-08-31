@@ -92,25 +92,33 @@ services:
               capabilities: [gpu]
     user: root
     restart: unless-stopped
+    init: true
     environment:
       - VLM_BACKEND=${VLM_BACKEND:-vllm}
       - OCR_QUALITY_FIRST=${OCR_QUALITY_FIRST:-false}
+      # Stop paddlex after idle so layout-detection VRAM is returned to the driver.
+      # -1 keeps the old always-resident behavior. GET /health does not reset the timer.
+      - PADDLEX_SLEEP_IDLE_SECONDS=${PADDLEX_SLEEP_IDLE_SECONDS:-60}
     volumes:
       - ./pipeline_config_vllm_quality.yaml:/home/paddleocr/pipeline_config_quality.yaml:ro
+      - ./paddlex-idle-serve.py:/home/paddleocr/paddlex-idle-serve.py:ro
     command:
       - /bin/bash
       - -c
       - |
         if [ "$${OCR_QUALITY_FIRST:-false}" = "true" ]; then
           echo "[startup] OCR_QUALITY_FIRST=true; serving quality pipeline YAML"
-          paddlex --serve --pipeline /home/paddleocr/pipeline_config_quality.yaml
+          CFG=/home/paddleocr/pipeline_config_quality.yaml
         else
-          paddlex --serve --pipeline /home/paddleocr/pipeline_config_$${VLM_BACKEND:-vllm}.yaml
+          CFG=/home/paddleocr/pipeline_config_$${VLM_BACKEND:-vllm}.yaml
         fi
+        PYTHON=$$(command -v python3 || command -v python || echo /usr/local/bin/python)
+        exec "$$PYTHON" /home/paddleocr/paddlex-idle-serve.py --pipeline "$$CFG"
     depends_on:
       paddleocr-vlm-server:
         condition: service_healthy
     healthcheck:
+      # Hits the idle proxy, not paddlex — so the probe cannot pin layout models in VRAM.
       test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
       interval: 30s
       timeout: 10s
