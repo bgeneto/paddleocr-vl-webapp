@@ -30,6 +30,9 @@ ENV/
 env/
 .venv/
 
+# Accidental local toolchain installs (e.g. ~/.local binaries copied into the repo)
+.local/
+
 # IDE
 .idea/
 .vscode/
