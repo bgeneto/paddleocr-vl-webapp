@@ -139,7 +139,7 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 ### Processing Options
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OCR_QUALITY_FIRST` | false | Master switch. `false` keeps the speed-first pipeline. `true` loads extra detectors, high-recall layout, figure/seal OCR, and cross-page reconstruction. On the llama.cpp stack it also switches KV cache from `q4_0` to `q8_0`. Recreate API, Streamlit, and `paddleocr-vlm-server` after changing it. |
+| `OCR_QUALITY_FIRST` | false | Master switch. `false` keeps the speed-first pipeline. `true` loads extra detectors, high-recall layout, figure/seal OCR, and cross-page reconstruction. On the llama.cpp stack, speed-first uses `q8_0` KV cache; quality-first leaves llama.cpp's default KV type (does not set `--cache-type-k/v`). Recreate API, Streamlit, and `paddleocr-vlm-server` after changing it. |
 | `USE_DOC_ORIENTATION_CLASSIFY` | false | Auto-detect document orientation (sidebar default; quality-first defaults this on) |
 | `USE_DOC_UNWARPING` | false | Correct curved/distorted documents. Stays **off** in quality-first (UVDoc unwarping 500s the llama.cpp VLM). |
 | `USE_LAYOUT_DETECTION` | true | Enable layout structure detection |

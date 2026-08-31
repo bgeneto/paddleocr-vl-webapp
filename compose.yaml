@@ -160,7 +160,7 @@ services:
       LLAMA_CTX_MAX: ${LLAMA_CTX_MAX:-131072}
       LLAMA_ARG_N_PARALLEL: ${LLAMA_N_PARALLEL:-8}
       LLAMA_ARG_FLASH_ATTN: on
-      # Entrypoint sets KV cache to q4_0 (speed) or q8_0 (OCR_QUALITY_FIRST=true)
+      # Entrypoint sets KV cache to q8_0 (speed) or llama.cpp default (OCR_QUALITY_FIRST=true)
       OCR_QUALITY_FIRST: ${OCR_QUALITY_FIRST:-false}
       # Default ubatch is 512; 2048 packs vision prefill in fewer GPU steps
       LLAMA_ARG_UBATCH: ${LLAMA_UBATCH_SIZE:-2048}
