@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -564,6 +565,7 @@ class OcrJob:
         self.current_file = ""
         self.progress = (0, 0)
         self.detail = ""
+        self.bar_ratio: float | None = None
         self.results: dict[str, dict] = {}
         self.messages: list[tuple[str, str]] = []
         self.error: str | None = None
@@ -578,11 +580,18 @@ class OcrJob:
         with self._lock:
             self.current_file = name
 
-    def set_progress(self, current: int, total: int, detail: str | None = None) -> None:
+    def set_progress(
+        self,
+        current: int,
+        total: int,
+        detail: str | None = None,
+        bar_ratio: float | None = None,
+    ) -> None:
         with self._lock:
             self.progress = (int(current), int(total))
             if detail is not None:
                 self.detail = detail
+            self.bar_ratio = bar_ratio
 
     def add_message(self, level: str, text: str) -> None:
         with self._lock:
@@ -605,6 +614,7 @@ class OcrJob:
                 "current_file": self.current_file,
                 "progress": self.progress,
                 "detail": self.detail,
+                "bar_ratio": self.bar_ratio,
                 "results": dict(self.results),
                 "messages": list(self.messages),
                 "error": self.error,
@@ -1021,8 +1031,8 @@ _VLM_PROMPT_METRIC_NAMES = (
     "llamacpp:prompt_tokens_total",
     "vllm:prompt_tokens_total",
 )
-# Decode tokens per PDF page (crops vary; this only paces the bar, not billing).
-_VLM_TOKENS_PER_PAGE = 160.0
+# Decode+prefill work units per PDF page (crops vary; this only paces the bar).
+_VLM_TOKENS_PER_PAGE = 500.0
 _VLM_METRICS_URL = (
     os.getenv("LLAMA_SERVER_URL", "http://paddleocr-vlm-server:8080").rstrip("/")
     + "/metrics"
@@ -1068,54 +1078,128 @@ def _page_range_label(page_indices: list[int], total_pages: int) -> str:
 
 
 class _ChunkProgress:
-    """Thread-safe page progress across parallel in-flight API chunks."""
+    """Thread-safe page progress across parallel in-flight API chunks.
+
+    The page count is pages actually saved. In-flight work is one shared
+    llama/vLLM /metrics + time estimate so fat chunks do not each claim
+    ``n_pages - 1`` from the same global token counter and freeze at 98%.
+    """
 
     def __init__(self, committed: int, total: int, callback) -> None:
         self._lock = threading.Lock()
         self.committed = committed
         self.total = total
-        self.soft: dict[int, int] = {}
+        self.inflight: dict[int, int] = {}
         self.labels: dict[int, str] = {}
         self.callback = callback
+        self._units0: float | None = None
+        self._last_units: float | None = None
+        self._t0: float | None = None
+        self._peak_bar = float(committed)
 
-    def _emit(self) -> None:
-        extra = sum(self.soft.values())
-        current = min(self.total, self.committed + extra)
+    def begin_chunk(self, idx: int, n_pages: int, label: str) -> None:
+        units = _vlm_work_units()
+        with self._lock:
+            if not self.inflight:
+                self._units0 = units
+                self._last_units = units
+                self._t0 = time.perf_counter()
+            elif units is not None:
+                self._last_units = units
+            self.inflight[idx] = n_pages
+            self.labels[idx] = label
+            self._emit_locked()
+
+    def pulse(
+        self,
+        idx: int,
+        range_label: str | None = None,
+        *,
+        verb_prefix: str | None = None,
+    ) -> None:
+        units = _vlm_work_units()
+        with self._lock:
+            if units is not None:
+                self._last_units = units
+            if idx in self.labels and range_label is not None:
+                if verb_prefix is not None:
+                    self.labels[idx] = f"{verb_prefix} {range_label}"
+                else:
+                    _extra, phase = self._estimate_locked()
+                    verb = (
+                        "recognizing"
+                        if phase == "recognize"
+                        else "detecting layout on"
+                    )
+                    self.labels[idx] = f"{verb} {range_label}"
+            self._emit_locked()
+
+    def finish_chunk(self, idx: int, n_pages: int) -> None:
+        with self._lock:
+            self.inflight.pop(idx, None)
+            self.labels.pop(idx, None)
+            self.committed += n_pages
+            if not self.inflight:
+                self._units0 = None
+                self._t0 = None
+                self._peak_bar = float(self.committed)
+            self._emit_locked()
+
+    def abandon_chunk(self, idx: int) -> None:
+        with self._lock:
+            self.inflight.pop(idx, None)
+            self.labels.pop(idx, None)
+            if not self.inflight:
+                self._units0 = None
+                self._t0 = None
+            self._emit_locked()
+
+    def _estimate_locked(self) -> tuple[float, str]:
+        n_inflight = sum(self.inflight.values())
+        if not n_inflight:
+            return 0.0, "done"
+        elapsed = time.perf_counter() - (self._t0 or time.perf_counter())
+        units = self._last_units
+        phase = "layout"
+        expected_tok = max(_VLM_TOKENS_PER_PAGE * n_inflight, 1.0)
+        expected_s = max(2.0 * n_inflight, 12.0)
+        time_frac = 1.0 - math.exp(-elapsed / expected_s)
+        if self._units0 is not None and units is not None:
+            delta = max(0.0, units - self._units0)
+            if delta >= 8:
+                phase = "recognize"
+            token_frac = 1.0 - math.exp(-delta / expected_tok) if delta else 0.0
+            frac = max(token_frac, 0.35 * time_frac)
+        else:
+            frac = time_frac
+        return n_inflight * 0.88 * frac, phase
+
+    def _emit_locked(self) -> None:
+        extra, _phase = (
+            self._estimate_locked() if self.inflight else (0.0, "done")
+        )
+        saved = self.committed
+        remaining = max(0, self.total - saved)
+        if remaining:
+            extra = min(extra, max(0.0, remaining - 0.2))
+        else:
+            extra = 0.0
+        bar_n = min(float(self.total), max(self._peak_bar, saved + extra))
+        if saved >= self.total and not self.inflight:
+            bar_n = float(self.total)
+        self._peak_bar = bar_n
         labels = [self.labels[k] for k in sorted(self.labels)]
         if labels:
             detail = "OCR " + "; ".join(labels)
         elif self.committed >= self.total and self.total:
             detail = ""
         else:
-            detail = f"{current}/{self.total} pages"
+            detail = f"{saved}/{self.total} pages saved"
+        bar_ratio = (bar_n / self.total) if self.total else 0.0
+        if self.inflight:
+            bar_ratio = min(bar_ratio, 0.97)
         if self.callback:
-            self.callback(current, self.total, detail)
-
-    def begin_chunk(self, idx: int, n_pages: int, label: str) -> None:
-        with self._lock:
-            self.soft[idx] = 0
-            self.labels[idx] = label
-            self._emit()
-
-    def set_soft(self, idx: int, extra: int, label: str | None = None) -> None:
-        with self._lock:
-            self.soft[idx] = extra
-            if label is not None:
-                self.labels[idx] = label
-            self._emit()
-
-    def finish_chunk(self, idx: int, n_pages: int) -> None:
-        with self._lock:
-            self.soft.pop(idx, None)
-            self.labels.pop(idx, None)
-            self.committed += n_pages
-            self._emit()
-
-    def abandon_chunk(self, idx: int) -> None:
-        with self._lock:
-            self.soft.pop(idx, None)
-            self.labels.pop(idx, None)
-            self._emit()
+            self.callback(saved, self.total, detail, bar_ratio)
 
 
 def process_chunk(args: tuple) -> tuple[int, list[int], list | None, str | None]:
@@ -1175,29 +1259,11 @@ def process_chunk(args: tuple) -> tuple[int, list[int], list | None, str | None]
         target=_post, name=f"ocr-chunk-{chunk_index}", daemon=True
     )
     worker.start()
-    t0 = time.perf_counter()
-    units0 = _vlm_work_units()
-    last_extra = 0
 
     while worker.is_alive():
         worker.join(0.35)
-        if tracker is None:
-            continue
-        elapsed = time.perf_counter() - t0
-        units = _vlm_work_units()
-        extra = last_extra
-        phase = "layout"
-        if units0 is not None and units is not None:
-            delta = max(0.0, units - units0)
-            if delta >= 8:
-                phase = "recognize"
-                extra = min(n_pages - 1, int(delta / _VLM_TOKENS_PER_PAGE))
-        elif n_pages > 1:
-            extra = min(n_pages - 1, int(elapsed / 0.5))
-        extra = max(last_extra, extra)
-        last_extra = extra
-        verb = "recognizing" if phase == "recognize" else "detecting layout on"
-        tracker.set_soft(chunk_index, extra, f"{verb} {label}")
+        if tracker is not None:
+            tracker.pulse(chunk_index, label)
 
     if "error" in box:
         if tracker is not None:
@@ -1226,16 +1292,10 @@ def process_chunk(args: tuple) -> tuple[int, list[int], list | None, str | None]
 
         # Persist before returning so a dying main thread does not lose this chunk
         if file_hash and fingerprint:
-            for i, (page_num, page_result) in enumerate(
-                zip(page_indices, parsing_results)
-            ):
+            for page_num, page_result in zip(page_indices, parsing_results):
                 save_page_result(file_hash, fingerprint, page_num, page_result)
                 if tracker is not None:
-                    tracker.set_soft(
-                        chunk_index,
-                        min(n_pages - 1, i + 1),
-                        f"saving {label}",
-                    )
+                    tracker.pulse(chunk_index, label, verb_prefix="saving")
 
         if tracker is not None:
             tracker.finish_chunk(chunk_index, n_pages)
@@ -1272,7 +1332,7 @@ def process_pdf_in_batches(
     Args:
         file_content: Raw bytes of the PDF file
         filename: Original filename
-        progress_callback: Optional callback(completed_pages, total_pages, detail=None)
+        progress_callback: Optional callback(saved_pages, total_pages, detail, bar_ratio)
         cancel_event: Optional threading.Event to signal cancellation
         max_workers: Maximum parallel chunk workers (default: MAX_PARALLEL_PAGES)
         pages_per_chunk: Pages per chunk for GPU batching (default: PAGES_PER_CHUNK)
@@ -1655,9 +1715,16 @@ def _render_ocr_job_progress(snapshot: dict) -> None:
     current, total = snapshot["progress"]
     detail = (snapshot.get("detail") or "").strip()
     if total:
-        ratio = min(1.0, max(0.0, current / total if total else 0.0))
+        stored = snapshot.get("bar_ratio")
+        if stored is not None:
+            ratio = min(1.0, max(0.0, float(stored)))
+        else:
+            ratio = min(1.0, max(0.0, current / total))
         if detail:
-            text = f"{name}: {current}/{total} · {detail}"
+            if stored is not None and current < total:
+                text = f"{name}: {current}/{total} saved · {detail}"
+            else:
+                text = f"{name}: {current}/{total} · {detail}"
         else:
             text = f"{name}: page {current}/{total}..."
         st.progress(ratio, text=text)
